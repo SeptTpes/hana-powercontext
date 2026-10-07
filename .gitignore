@@ -1,0 +1,20 @@
+# 凭据与环境配置（PowerContext Server .env、config 向导目录）
+.env
+powercontext-config/
+
+# 构建与运行产物
+node_modules/
+__pycache__/
+.venv/
+dist/
+*.log
+
+# 系统杂项
+.DS_Store
+
+# 本地工具链与 Server 运行数据（uv、SQLite、冒烟中间产物，勿入库）
+.tools/
+powercontext-data/
+artifacts/stage0/*.json
+artifacts/stage0/*.pid
+artifacts/stage0/server.log
