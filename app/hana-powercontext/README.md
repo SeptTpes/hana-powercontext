@@ -53,6 +53,34 @@ Three properties, all deliberate:
 Recall is cached per session for 60 seconds, so a tool loop inside one turn costs
 one request rather than one per step.
 
+### Query shaping (stage 2B)
+
+The Server's prepare path matches entities, not questions: sent a whole
+natural-language sentence it answers `status: "empty"`, and sent the same
+sentence's noun phrase it recalls the entry. Measured four ways in
+[`artifacts/stage2/prepare-query-experiment.py`](../../artifacts/stage2/prepare-query-experiment.py),
+and side by side against `/v1/memory/search` in
+[`artifacts/stage2/query-probe.md`](../../artifacts/stage2/query-probe.md).
+
+So the hook shapes the query before it sends it — `extractRetrievalQuery()` in
+`lib/hooks.js`, applied to the last user message:
+
+1. instruction sentences are dropped ("你是一个全新会话。请不要调用任何工具。");
+2. brackets, quotes and markup are stripped ("**PowerContext**" → `PowerContext`);
+3. stop words are filtered, Chinese and English ("地址是什么", "what is the …");
+4. **if nothing usable is left, the original text is sent instead** — the layer
+   never invents a query, it only removes noise, so the worst case is the
+   behaviour that existed before it.
+
+`PowerContext Server 地址是什么？` therefore reaches the Server as
+`PowerContext Server`. The 512-byte cap applies before and after the pass.
+
+Two things it deliberately does **not** touch: the *injected* message (that is
+the Server's own prepared block, verbatim) and the *captured* prompt (capture
+stores what the user typed, not the retrieval key). `/pc hooks` reports
+`extract_hits` and `skipped_empty_extracted` so the layer is observable rather
+than assumed.
+
 ### Switches
 
 | Key | Env var | Default | Meaning |

@@ -67,6 +67,17 @@ export const counters = {
   injections: 0,
   skipped_disabled: 0,
   skipped_empty: 0,
+  /**
+   * Extraction produced no usable phrase *and* the verbatim fallback was empty
+   * too — the union of both, which is the honest reading of the name
+   * ("skipped because the extracted query was empty, fallback included").
+   * It is not a count of extra skips on top of `skipped_empty`: the
+   * extraction-empty case reports here *instead of* there, so no step is ever
+   * counted in both. See D18.
+   */
+  skipped_empty_extracted: 0,
+  /** Steps where extraction produced a query that differs from the raw text. */
+  extract_hits: 0,
   skipped_error: 0,
   skipped_no_query: 0,
   skipped_oversize: 0,
@@ -285,6 +296,177 @@ export function sessionKeyOf(session) {
 /** Last query seen per session, for tool-loop steps that carry no new user text. */
 const lastQuery = new Map();
 
+/**
+ * Retrieval stop list, Chinese and English, matched case-insensitively.
+ *
+ * The Server's prepare path matches entities, not questions: a full natural
+ * language sentence returns `status: "empty"` while the same sentence's noun
+ * phrase recalls the entry (measured, four-way experiment in
+ * `artifacts/stage2/prepare-query-experiment.py`). This list is therefore
+ * deliberately narrow — it drops the *asking* words (什么/怎么/what/is/please)
+ * and keeps every word that could name a thing. Over-filtering is worse than
+ * under-filtering here, because a query that loses its entity recalls nothing
+ * while a query that keeps a stray "is" still recalls: hence the fallback to
+ * the verbatim text whenever extraction comes back too short.
+ *
+ * Entries are grouped by what they are for, so the list can be audited:
+ *   1. question words and interrogative tails
+ *   2. politeness / instruction words
+ *   3. articles, auxiliaries, prepositions, pronouns (English)
+ *   4. discourse words that name no entity ("address", "我之前", "的")
+ *
+ * The "address"/"地址" entry looks surprising and earns its place: in
+ * "PowerContext Server 地址是什么" the entity is `PowerContext Server`, and
+ * keeping "地址" leaves a phrase the Server's matcher scores as two competing
+ * tokens instead of one clean entity. `http://127.0.0.1:8000` in a query is a
+ * token, not the word "address", so nothing a user actually needs is dropped.
+ */
+export const EXTRACT_STOPWORDS = [
+  // 1. question words and interrogative tails
+  "什么", "是什么", "是什么意思", "怎么", "怎么办", "如何", "为什么", "哪个", "哪些", "多少", "吗", "呢", "么", "是否",
+  // 2. politeness and instruction words
+  "请", "请问", "问", "帮我", "帮忙", "麻烦", "请你", "你可以", "可以的", "谢谢", "你是一个全新会话", "全新会话",
+  "请不要调用工具", "不要调用工具", "不要调用任何工具", "请不要", "记住的", "记住", "让你记住的", "让你", "我之前",
+  "刚才", "前面", "上面", "一下", "一个", "这个", "那个",
+  // 3. English function words
+  "what", "which", "who", "whose", "whom", "when", "where", "why", "how", "is", "are", "was", "were", "am", "be",
+  "been", "being", "the", "a", "an", "do", "does", "did", "done", "please", "my", "me", "i", "you", "your", "we",
+  "our", "it", "its", "this", "that", "these", "those", "before", "in", "to", "for", "of", "on", "at", "by", "with",
+  "and", "or", "but", "if", "then", "than", "so", "as", "from", "about", "into", "over", "under", "again", "tell",
+  "say", "said", "know", "remember", "ask", "asked", "url", "address", "addr", "base",
+  // 4. discourse words that name no entity
+  "的", "了", "着", "吗", "呢", "是", "地址", "你上次说的", "上次说的", "我们上次讨论的", "上次讨论的", "上次", "我们",
+  "你", "说的", "在哪里", "在哪儿", "哪个", "的那个",
+];
+
+/** Instruction prefixes removed before stop-word filtering (see 2 above). */
+const INSTRUCTION_PREFIX_SOURCE =
+  "(你是一个全新会话|这是一个全新会话|全新会话|请不要调用(任何)?工具|不要调用(任何)?工具|请你?|请问|请|帮我|帮忙|麻烦你?|你可以)+";
+
+/**
+ * A fresh pattern per use. `String.replace` with a global regex advances its own
+ * `lastIndex`, so a shared instance would silently skip a match on the second
+ * call from the same position — a statefulness bug that only shows up on the
+ * second message of a session.
+ */
+const instructionPrefix = () => new RegExp(INSTRUCTION_PREFIX_SOURCE, "g");
+
+/** What splitting a user message into candidate fragments looks like. */
+const SENTENCE_SPLIT = /[\n\r。！？!?；;.]+/;
+
+/**
+ * A literal dot inside a host name, an IPv4 address or a file name is not a
+ * sentence boundary. "127.0.0.1:8000" must survive as one token, so those dots
+ * are parked behind a placeholder for the split and restored afterwards.
+ */
+const URL_LIKE = /[A-Za-z0-9_@:/\\-]+(?:\.[A-Za-z0-9_@:/\\-]+)+/g;
+const DOT_PLACEHOLDER = "\u0000";
+
+/** Full-width spaces and punctuation inside a CJK run are boundaries. */
+const PUNCTUATION = /[\u3000-\u303f\uff00-\uffef]/g;
+
+/**
+ * Strip the conversational shape from one user message and return a phrase
+ * shaped for retrieval — or the original text when nothing usable is left.
+ *
+ * The rules, in order:
+ *
+ *   1. **Drop instruction sentences.** A user paste often opens with a harness
+ *      preamble ("你是一个全新会话。请不要调用任何工具。"). Those fragments name
+ *      nothing; the sentence that carries the question is kept.
+ *   2. **Strip brackets, quotes and markup.** `**bold**`, `\`code\``, 《》「」,
+ *      quotes and list bullets are formatting, not content.
+ *   3. **Filter stop words.** Chinese runs have no spaces, so a stop word is
+ *      removed *inside* a token ("地址是什么" -> "地址"); English tokens are
+ *      matched whole so that "thesaurus" is not "saurus".
+ *   4. **Fall back to the raw text** when the result is empty or shorter than
+ *      two characters. The Server's own prepare can decide what to do with a
+ *      question; guessing a phrase out of nothing cannot improve on that.
+ *
+ * Pure and total: any input, including a non-string, returns a string, and the
+ * output is never longer than `QUERY_MAX_CHARS` UTF-8 bytes.
+ */
+export function extractRetrievalQuery(userText) {
+  const raw = typeof userText === "string" ? userText.trim() : "";
+  const capped = truncateToBytes(raw, QUERY_MAX_CHARS).trim();
+
+  // Park the dots that belong to a host name or a file name, split on what is
+  // left, then put them back: "127.0.0.1:8000" is one entity, not four.
+  const sentences = capped
+    .replace(URL_LIKE, (match) => match.split(".").join(DOT_PLACEHOLDER))
+    .split(SENTENCE_SPLIT)
+    .map((sentence) => sentence.split(DOT_PLACEHOLDER).join("."))
+    .map((sentence) => sentence.replace(/^\s*(?:[-*•·>]+|\d+[.)])\s*/, "").replace(instructionPrefix(), " "))
+    .map((sentence) => sentence.replace(PUNCTUATION, " ").replace(/["'\`“”‘’「」『』《》〈〉【】\[\]{}()<>]/g, " "))
+    .map((sentence) => sentence.replace(/[*_~|^#>]+/g, " "))
+    .map((sentence) => sentence.replace(/\s+/g, " ").trim())
+    .filter((sentence) => hasSubstance(sentence));
+
+  const kept = [];
+  for (const sentence of sentences) {
+    for (const token of sentence.split(" ")) {
+      const cleaned = stripStopwords(token);
+      if (cleaned !== "") kept.push(cleaned);
+    }
+  }
+  const extracted = kept.join(" ").replace(/\s+/g, " ").trim();
+
+  // Rules 1-3 either produced something usable or they did not. Too short means
+  // "nothing usable": two characters is the floor for a phrase that could match
+  // an entity, and it is a byte floor because a lone CJK character is 3 bytes.
+  if (extracted === "" || utf8Bytes(extracted) < 2) {
+    return { extracted: "", query: capped, usedFallback: true };
+  }
+  return { extracted, query: truncateToBytes(extracted, QUERY_MAX_CHARS).trim(), usedFallback: false };
+}
+
+/** Words that remain after an instruction prefix is stripped but name nothing. */
+const FILLER_ONLY = new Set(["任何", "所有", "这些", "那些", "一下", "一个", "这个", "那个", "the", "a", "an", "it"]);
+
+/**
+ * Would this fragment still say something after the instruction prefix is gone?
+ *
+ * A fragment made only of an instruction and its filler ("请不要调用任何工具")
+ * is dropped whole. A fragment that keeps an entity ("请记住 Server 地址是
+ * http://127.0.0.1:8000") is kept, because dropping it would drop the fact.
+ */
+function hasSubstance(fragment) {
+  if (fragment === "") return false;
+  // Non-CJK text (an English sentence, a URL, a path) keeps its own words and is
+  // always worth filtering; only CJK filler needs this guard.
+  if (!/[\u3400-\u9fff]/.test(fragment)) return true;
+  const residue = fragment.replace(instructionPrefix(), " ").replace(/[\s的了吗呢，,、]/g, "");
+  if (residue === "") return false;
+  return !FILLER_ONLY.has(residue);
+}
+
+/**
+ * Remove stop words from one token; CJK matches inside, ASCII matches whole.
+ *
+ * The asymmetry is the point. Chinese has no spaces, so "地址是什么" arrives as
+ * a single token and the question word has to be removed from *inside* it.
+ * English does have spaces, so matching inside would turn "thesaurus" into
+ * "saurus"; a token that is exactly a stop word is dropped, nothing else.
+ *
+ * Markup characters can survive inside a CJK run ("**地址**"), so every token is
+ * trimmed of non-word residue at its edges before it is kept.
+ */
+function stripStopwords(token) {
+  let out = token;
+  for (const word of EXTRACT_STOPWORDS) {
+    if (out === "") break;
+    if (/^[\x00-\x7f]+$/.test(word)) {
+      if (out.toLowerCase() === word) return "";
+    } else {
+      out = out.split(word).join("");
+    }
+  }
+  // Unicode-aware: a CJK character is a word character, and stripping the edges
+  // must not strip it. \p{L} covers a-z, A-Z and Han; the rest are dropped.
+  const trimmed = out.replace(/^[^\p{L}\p{N}]+|[^\p{L}\p{N}]+$/gu, "");
+  return /[\p{L}\p{N}]/u.test(trimmed) ? trimmed : "";
+}
+
 export function queryFromMessages(messages) {
   const index = lastUserIndex(messages);
   if (index < 0) return { query: "", index: -1 };
@@ -299,6 +481,11 @@ function rememberQuery(sessionKey, query) {
 
 export function resetLastQuery() {
   lastQuery.clear();
+}
+
+/** The session's remembered query, or undefined. Read-only, for the probes. */
+export function lastQueryFor(sessionKey) {
+  return lastQuery.get(sessionKey);
 }
 
 /* ------------------------------------------------------------- injection -- */
@@ -486,9 +673,18 @@ export async function preStepDecision(sdk, config, invocation, deps = {}) {
     return undefined;
   }
 
-  const { query, index } = queryFromMessages(messages);
+  // Layer 1: the verbatim last-user-message query (unchanged since stage 2).
+  const { query: rawQuery, index } = queryFromMessages(messages);
+
+  // Layer 2: the retrieval-shaping pass added in stage 2B. The raw text is the
+  // fallback *inside* the extractor, so the only way to arrive here with an
+  // empty query is an empty or unusable message — not a badly shaped one.
+  const { query, extracted, usedFallback } = rawQuery === ""
+    ? { query: "", extracted: "", usedFallback: false }
+    : extractRetrievalQuery(rawQuery);
 
   if (query === "") {
+    counters.skipped_empty_extracted += 1;
     // A pure tool-loop step: no new user text. Falling back to the session's last
     // query keeps recall alive across the steps of one turn without inventing a
     // query the user never typed.
@@ -510,6 +706,11 @@ export async function preStepDecision(sdk, config, invocation, deps = {}) {
     return finishInjection(messages, recall, config, counters);
   }
 
+  // A step whose extraction actually changed the text is counted once, here and
+  // nowhere else, so `extract_hits` is exactly "how much work the layer is
+  // doing" rather than an approximation of it.
+  if (!usedFallback && extracted !== rawQuery) counters.extract_hits += 1;
+
   rememberQuery(sessionKey, query);
 
   const recall = await safePrepare(prepareRecallFn, sdk, config, sessionKey, query, invocation.signal);
@@ -525,9 +726,16 @@ export async function preStepDecision(sdk, config, invocation, deps = {}) {
 
   // Capture is best-effort and strictly after a successful recall, so a capture
   // problem can never be the reason a step lost its injection.
+  //
+  // It captures `rawQuery`, not the extracted phrase, and that is a deliberate
+  // separation of the two consumers: the extractor exists so the *matcher* can
+  // find something, and losing the user's own wording to it would be a
+  // regression in what capture means — the prompt as typed, kept for later
+  // reading by a human or a model. The extracted phrase is a retrieval key; it
+  // is not the record.
   if (config.capturePrompts && recall.scopeId) {
     try {
-      await capturePromptFn(sdk, config, recall.scopeId, query);
+      await capturePromptFn(sdk, config, recall.scopeId, rawQuery);
     } catch {
       counters.captures_failed += 1;
     }

@@ -537,6 +537,11 @@ export async function commandHooks(config, probeCapabilities) {
     "injections",
     "skipped_disabled",
     "skipped_empty",
+    // Stage 2B: the extraction layer's own two counters. They answer the
+    // question a bare injection count cannot — whether the query that reached
+    // the Server was the user's sentence or a phrase the matcher could use.
+    "skipped_empty_extracted",
+    "extract_hits",
     "skipped_no_query",
     "skipped_error",
     "cache_hits",

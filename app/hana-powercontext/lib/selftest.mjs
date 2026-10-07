@@ -21,6 +21,8 @@ import {
   messageText,
   lastUserIndex,
   wrapRecall,
+  extractRetrievalQuery,
+  EXTRACT_STOPWORDS,
   truncateToBytes,
   injectBeforeLastUser,
   queryFromMessages,
@@ -549,6 +551,63 @@ section("stage 2 message plumbing");
   check("no session identity is reported as anonymous", sessionKeyOf(null) === "anonymous");
 }
 
+/* ------------------------------------- stage 2B: query extraction (plan A) -- */
+
+section("stage 2B query extraction (extractRetrievalQuery)");
+{
+  // The exact failing sentence from the T9 diagnostic (four-way experiment,
+  // artifacts/stage2/prepare-query-experiment.py): status "empty" verbatim, and
+  // the noun phrase below is the shape that reliably reaches the entry.
+  const prefixed =
+    "你是一个全新会话。请不要调用任何工具。我之前让你记住的 PowerContext Server 地址是什么？";
+  const outcome = extractRetrievalQuery(prefixed);
+  check("1. the conversation prefix is dropped", !/全新会话|不要调用/.test(outcome.query), outcome.query);
+  check("1. the T9 sentence extracts to its entity phrase", outcome.query === "PowerContext Server", outcome.query);
+  check("1. extraction is reported as a hit, not a fallback", outcome.usedFallback === false, outcome);
+
+  const quoted = extractRetrievalQuery("「PowerContext」的 Server 地址是什么？");
+  check("2. corner brackets and CJK quotes are stripped", quoted.query === "PowerContext Server", quoted.query);
+  const marked = extractRetrievalQuery("请问 **PowerContext Server** 的地址是什么？");
+  check("2. markdown emphasis does not survive into the query", !marked.query.includes("*"), marked.query);
+  check("2. the entity inside the markup is kept", marked.query === "PowerContext Server", marked.query);
+
+  // Pinned to the real output rather than to the tidiest possible phrase: the
+  // list is deliberately conservative (see EXTRACT_STOPWORDS), and a test that
+  // only passes after widening it would be pressure to over-filter.
+  const zhongwen = extractRetrievalQuery("我们上次讨论的那个部署端点是什么");
+  check(
+    "3. zhongwen stop words are removed",
+    zhongwen.query === "讨论部署端点" && !/我们|是什么|那个|上次/.test(zhongwen.query),
+    zhongwen.query,
+  );
+  check("3. English stop words are removed", extractRetrievalQuery("what is the PowerContext Server").query === "PowerContext Server", extractRetrievalQuery("what is the PowerContext Server").query);
+  check(
+    "3. a mixed sentence keeps only its entities",
+    extractRetrievalQuery("please 帮我查一下 PowerContext Server 的地址").query === "查 PowerContext Server",
+    extractRetrievalQuery("please 帮我查一下 PowerContext Server 的地址").query,
+  );
+  check("3. the stop list is not empty and is mixed-language", EXTRACT_STOPWORDS.length >= 80 && EXTRACT_STOPWORDS.includes("什么") && EXTRACT_STOPWORDS.includes("the"), EXTRACT_STOPWORDS.length);
+
+  // The fallback is the safety property: when extraction has nothing to stand
+  // on, the Server gets the user's own words rather than an empty query.
+  const blank = extractRetrievalQuery("   ");
+  check("4. an empty message falls back to the empty text", blank.query === "" && blank.usedFallback === true, blank);
+  const politeness = extractRetrievalQuery("请");
+  check("4. nothing but politeness falls back to the original", politeness.query === "请" && politeness.usedFallback === true, politeness);
+  check("4. the fallback is exactly the input, not a rewrite", extractRetrievalQuery("是什么？").query === "是什么？", extractRetrievalQuery("是什么？").query);
+  check("4. a clearly phrased sentence extracts rather than falls back", extractRetrievalQuery("what is the PowerContext Server base URL").usedFallback === false);
+
+  const long = extractRetrievalQuery("z".repeat(4000));
+  check("5. the extraction result stays inside the 512-byte cap", Buffer.byteLength(long.query, "utf8") <= QUERY_MAX_CHARS, Buffer.byteLength(long.query, "utf8"));
+  const longCjk = extractRetrievalQuery("地址是什么".repeat(200));
+  check("5. a pre-truncated CJK input cannot split a character", !longCjk.query.includes("\uFFFD"), longCjk.query.slice(-12));
+  check("5. a non-string input reads as empty rather than throwing", extractRetrievalQuery(null).query === "" && extractRetrievalQuery(42).query === "");
+
+  // A dot inside a host name is not a sentence boundary.
+  const url = extractRetrievalQuery("PowerContext Server at http://127.0.0.1:8000 please");
+  check("6. an IPv4 host survives sentence splitting intact", url.query.includes("127.0.0.1:8000"), url.query);
+}
+
 section("stage 2 byte accounting");
 {
   check("under budget is returned unchanged", truncateToBytes("abc", 10) === "abc");
@@ -614,9 +673,10 @@ section("stage 2 counters and /pc hooks");
   resetCounters();
   check("counters start at zero", counters.prestep_invocations === 0 && counters.injections === 0);
   check("every documented counter exists", [
-    "prestep_invocations", "injections", "skipped_disabled", "skipped_empty", "skipped_no_query",
-    "skipped_error", "cache_hits", "cache_misses", "captures", "captures_duplicate", "captures_failed",
-    "beforestart_invocations", "beforestart_injections", "beforestart_skipped",
+    "prestep_invocations", "injections", "skipped_disabled", "skipped_empty", "skipped_empty_extracted",
+    "extract_hits", "skipped_no_query", "skipped_error", "cache_hits", "cache_misses", "captures",
+    "captures_duplicate", "captures_failed", "beforestart_invocations", "beforestart_injections",
+    "beforestart_skipped",
   ].every((k) => typeof counters[k] === "number"), Object.keys(counters));
 
   const sdk = stubSdk(() => jsonResponse(200, {})).sdk;
@@ -632,6 +692,10 @@ section("stage 2 counters and /pc hooks");
   check("/pc hooks reports capture as off", /capturePrompts\s+off/.test(withProbe), withProbe);
   check("/pc hooks reports the grant status from the host", withProbe.includes("always") && withProbe.includes("not_asked"), withProbe);
   check("/pc hooks names the cache TTL", withProbe.includes(String(CACHE_TTL_MS / 1000)), withProbe);
+  // The stage 2B counters are what the T9-r3 acceptance reads: injections > 0
+  // proves the layer ran, extract_hits proves it did something.
+  check("/pc hooks renders the extraction counters", /skipped_empty_extracted\s+\d+/.test(withProbe), withProbe);
+  check("/pc hooks renders extract_hits", /extract_hits\s+\d+/.test(withProbe), withProbe);
 
   const offConfig = resolveConfig(sdk, { prestep: false, capturePrompts: true });
   const offText = await commandHooks(offConfig, async () => ({ capabilities: [] }));

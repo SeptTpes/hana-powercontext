@@ -22,6 +22,7 @@ import {
   resetCounters,
   resetCaptureDedupe,
   resetLastQuery,
+  lastQueryFor,
   recallCacheSize,
   clearRecallCache,
   lastUserIndex,
@@ -186,7 +187,11 @@ section("pre-step: injection");
 
   check("exactly one prepare request was made", h.calls.filter((c) => c.url.endsWith("/v1/context/prepare")).length === 1, h.calls.map((c) => c.url));
   const req = h.calls.find((c) => c.url.endsWith("/v1/context/prepare"));
-  check("the query is the last user message text", req.body.query === "what did we decide about the deployment endpoint?", req.body.query);
+  // Stage 2B changed this assertion on purpose: the ask is now shaped before it
+  // is sent, so the Server sees the phrase rather than the question. The
+  // instrument panel's verbatim query is the job of the capture path, not this.
+  check("the query is the extracted phrase, not the verbatim question", req.body.query === "decide deployment endpoint", req.body.query);
+  check("and that extraction is counted", counters.extract_hits === 1, counters.extract_hits);
   check("the request carries the Scope", req.body.scope_id === "scp_hook_probe", req.body.scope_id);
   check("the request carries the pre-step byte budget", req.body.max_bytes === 8192, req.body.max_bytes);
   check("the request carries the pre-step timeout", req.init.timeoutMs === 2000, req.init.timeoutMs);
@@ -208,7 +213,7 @@ section("pre-step: query extraction");
     session: { sessionId: "s2", sessionPath: "/tmp/b" },
   });
   const req2 = h2.calls.find((c) => c.url.endsWith("/v1/context/prepare"));
-  check("array content flattens to its text parts", req2.body.query === "part one\npart two", req2.body.query);
+  check("array content flattens to its text parts", req2.body.query === "part one part two", req2.body.query);
   check("image data never reaches the query", !req2.body.query.includes("AAAA"), req2.body.query);
 
   // A tool-loop step carries no new user text: the previous query is reused.
@@ -230,6 +235,56 @@ section("pre-step: query extraction");
   check("a queryless step with no history injects nothing", noQuery === undefined, noQuery);
   check("it is counted as skipped_no_query", counters.skipped_no_query === 1, counters.skipped_no_query);
   check("and makes no request", h4.calls.length === 0, h4.calls.length);
+}
+
+/* ------------------------------------------------- query extraction (2B) -- */
+
+section("pre-step: retrieval query extraction");
+{
+  const cases = [
+    ["prefix + stop words (zh)", "你是一个全新会话。请不要调用任何工具。我之前让你记住的 PowerContext Server 地址是什么？", "PowerContext Server", "/tmp/prefix-zh"],
+    ["stop words only (zh)", "PowerContext Server 地址", "PowerContext Server", "/tmp/stop-zh"],
+    ["stop words only (en)", "what is the PowerContext Server base URL for hana-powercontext", "PowerContext Server hana-powercontext", "/tmp/stop-en"],
+  ];
+  let rememberedAfterPrefix = null;
+  for (const [label, text, expected, sessionPath] of cases) {
+    const h = await freshHarness(okPrepare("x"));
+    await h.preStep({ messages: [{ role: "user", content: text }], session: { sessionId: label, sessionPath } });
+    const req = h.calls.find((c) => c.url.endsWith("/v1/context/prepare"));
+    check(`${label}: the Server receives the extracted phrase`, req && req.body.query === expected, req && req.body.query);
+    check(`${label}: the extraction is counted`, counters.extract_hits >= 1, counters.extract_hits);
+    // Read inside the same closure: freshHarness installs a new module-level
+    // lastQuery map, so a lookup after the loop would read a different one.
+    if (sessionPath === "/tmp/prefix-zh") rememberedAfterPrefix = lastQueryFor(sessionPath);
+  }
+
+  // The fallback branch, at the loop level: text the extractor cannot improve on
+  // is sent as it was, and is *not* counted as an extraction hit. The task book
+  // requires both branches to be asserted separately, and this is that pair.
+  const fb = await freshHarness(okPrepare("x"));
+  counters.extract_hits = 0;
+  await fb.preStep({ messages: [{ role: "user", content: "是什么？" }], session: { sessionId: "fb", sessionPath: "/tmp/fb" } });
+  const fbReq = fb.calls.find((c) => c.url.endsWith("/v1/context/prepare"));
+  check("the fallback branch sends the verbatim text in a query-shaped input", fbReq.body.query === "是什么？", fbReq.body.query);
+  check("the fallback branch is not counted as an extraction hit", counters.extract_hits === 0, counters.extract_hits);
+
+  // An empty user message is the only thing that can leave the query empty, and
+  // that is what the new counter is for.
+  const empty = await freshHarness(okPrepare("x"));
+  counters.skipped_empty_extracted = 0;
+  const emptyStep = await empty.preStep({ messages: [{ role: "user", content: "   " }], session: { sessionId: "e", sessionPath: "/tmp/e" } });
+  check("an empty user message injects nothing", emptyStep === undefined, emptyStep);
+  check("it is counted as skipped_empty_extracted", counters.skipped_empty_extracted >= 1, counters.skipped_empty_extracted);
+  check("and it makes no request", empty.calls.length === 0, empty.calls.length);
+  check("nothing was remembered for that session", lastQueryFor("/tmp/e") === undefined, lastQueryFor("/tmp/e"));
+
+  // The remembered query is the extracted one, so a tool-loop step in the same
+  // session keeps asking the question the Server could actually answer.
+  check(
+    "the remembered query for the tool-loop path is the extracted phrase",
+    rememberedAfterPrefix === "PowerContext Server",
+    rememberedAfterPrefix,
+  );
 }
 
 /* ------------------------------------------------------------ failures --- */
@@ -360,7 +415,9 @@ section("pre-step: input capture");
   check("capture on: exactly one capture call", captured.length === 1, on.calls.map((c) => c.url));
   check("capture on: exactly one prepare call", on.calls.filter((c) => c.url.endsWith("/v1/context/prepare")).length === 1, on.calls.map((c) => c.url));
   check("capture uses the pc-capture id shape", /^pc-capture-\d{17}-\d{4}$/.test(captured[0].body.source_id), captured[0].body.source_id);
-  check("capture sends the prompt text", captured[0].body.content === "a prompt to capture", captured[0].body.content);
+  // Capture keeps the verbatim prompt: the extractor exists for the matcher, and
+  // rewriting what gets stored would lose the user's own wording from the record.
+  check("capture sends the verbatim prompt, not the extracted phrase", captured[0].body.content === "a prompt to capture", captured[0].body.content);
   check("capture sends the Scope", captured[0].body.scope_id === "scp_hook_probe", captured[0].body.scope_id);
   check("capture stamps its provenance", captured[0].body.metadata.captured_by === "hana-powercontext", captured[0].body.metadata);
   check("capture is counted", counters.captures === 1, counters.captures);
