@@ -62,7 +62,20 @@ export default defineApp(async (sdk) => {
   // ledger answers per turn: without `app/hooks.agent-pre-step` the host skips
   // this App and the turn proceeds untouched. The App never grants itself
   // anything; that decision belongs to the user in Hana's permission UI.
-  const hookDisposers = []; // BISECT: registration disabled
+  //
+  // BUG-2: the D16 bisect left this line in its disabled state and it shipped
+  // that way (v0.2.0 logged "registered 0 hook adjudicator(s)"). The wiring is
+  // the whole point of stage 2 — restore it and fail loudly if it ever
+  // regresses, because a silently absent hook is indistinguishable from a
+  // silently ungranted one at the tool layer.
+  const hookDisposers = await registerHooks(sdk, configNow, (message) => {
+    void sdk.logger.info(`hana-powercontext: ${message}`);
+  });
+  if (!Array.isArray(hookDisposers) || hookDisposers.length !== 2) {
+    await sdk.logger.warn(
+      `hana-powercontext: expected 2 hook adjudicators, got ${Array.isArray(hookDisposers) ? hookDisposers.length : typeof hookDisposers}`,
+    );
+  }
   await sdk.logger.info(`hana-powercontext registered ${hookDisposers.length} hook adjudicator(s)`);
 
   /** Ask the host's own ledger what this App has actually been granted. */

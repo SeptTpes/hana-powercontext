@@ -15,23 +15,80 @@ live in the PowerContext Server. What is here is the wiring — and one guarante
 | Tool | `pc_remember` | Write one durable memory entry into a Scope |
 | Tool | `pc_memory_list` | Read the entries in a Scope (read-only) |
 | Tool | `pc_handoff_prepare` | Finalize a transferable Handoff: capture → prepare → finalize in one call |
-| Command | `/pc` | `doctor` · `scope` · `memory` · `handoff` |
+| Command | `/pc` | `doctor` · `scope` · `memory` · `hooks` · `handoff` |
 | Command | `/powercontext` | Alias for `/pc` |
+| Hook | `agent/pre-step` | **Automatic bounded recall before each model step** (stage 2) |
+| Hook | `agent/before-start` | Handoff injection at turn start — code only, default off |
 
 `/pc doctor` answers the one question worth answering first: is the Server there,
-and is it ready.
+and is it ready. `/pc hooks` answers the second: is recall actually firing, and
+has the user granted the hooks.
 
-Not in this version: automatic recall injection (the `agent/pre-step` hook) and
-the Handoff board card. Those are stages 2 and 3; this App declares no hook
-capability words, so installing it grants no hook authority.
+Not in this version: the Handoff board card (stage 3).
+
+## Automatic recall (stage 2)
+
+The point of the App. Before each model step the `agent/pre-step` hook asks the
+Server for bounded context and, when it gets some, inserts **one** message
+immediately before the user's own message:
+
+```
+[PowerContext recall · untrusted_history]
+<the Server's prepared context, verbatim>
+[end recall]
+```
+
+Three properties, all deliberate:
+
+- **Nothing existing is touched.** Every other message is passed through by
+  reference. Recall is additive; the user's own words stay last, where the model
+  looks for the actual request.
+- **The wrapper is not decoration.** A recalled passage placed in the transcript
+  is otherwise indistinguishable from the user's own words or from an
+  instruction. The markers carry that boundary into the model input itself.
+- **A failure injects nothing.** Unreachable, timed out, empty, or switched off
+  returns "no change" — the turn proceeds exactly as if the App were not
+  installed. There is no retry and no queue.
+
+Recall is cached per session for 60 seconds, so a tool loop inside one turn costs
+one request rather than one per step.
+
+### Switches
+
+| Key | Env var | Default | Meaning |
+|---|---|---|---|
+| `prestep` | `POWERCONTEXT_HANA_PRESTEP` | `true` | Kill-switch for recall injection |
+| `prestepMaxBytes` | `POWERCONTEXT_HANA_PRESTEP_MAX_BYTES` | `8192` | Recall body budget (protocol max 32768) |
+| `prestepTimeoutMs` | `POWERCONTEXT_HANA_PRESTEP_TIMEOUT_MS` | `2000` | Hook-path timeout |
+| `capturePrompts` | `POWERCONTEXT_HANA_CAPTURE_PROMPTS` | `false` | Capture user prompts as Sources |
+| `captureMaxBytes` | `POWERCONTEXT_HANA_CAPTURE_MAX_BYTES` | `4096` | Per-prompt capture cap |
+| `beforeStart` | `POWERCONTEXT_HANA_BEFORE_START` | `false` | Inject the latest committed Handoff at turn start |
+
+Boolean values accept `true/false`, `1/0`, `yes/no`, `on/off`; anything else is
+ignored rather than guessed, so a typo in a kill-switch cannot silently read as
+"off".
+
+`capturePrompts` is off by default because it writes the user's own prompts to
+the Server. When enabled it captures only user prompts — not tool results, not
+assistant messages — and skips text it has already captured in the last 32
+prompts.
+
+`beforeStart` needs a committed Handoff to inject, which needs a Server with a
+generation provider; on a basic-memory Server it is a no-op by construction. See
+[the handoff section](#the-handoff-flow-and-its-one-prerequisite).
 
 ## Requirements
 
 - Hana `1.0.0-beta` or newer (`minAppVersion` pins the SDK this was built against).
 - A PowerContext Server listening on `http://127.0.0.1:8000`.
-- The host must grant `app/tools.expose-to-model`, and the App must be enabled for
-  the Agent you want to use it with. Both are user decisions in Hana's own
-  permission UI; this App never prompts for them.
+- The host must grant `app/tools.expose-to-model` and `app/hooks.agent-pre-step`,
+  and the App must be enabled for the Agent you want to use it with. All of these
+  are user decisions in Hana's own permission UI; this App never prompts for them,
+  and it never grants itself anything. Without the hook grant the host simply
+  skips this App's adjudicator and the turn proceeds — that is the host's own
+  fail-open behaviour, not something the App implements.
+- `app/hooks.agent-before-start` is declared but its hook does nothing until
+  `beforeStart` is switched on and the Server can produce a Handoff.
 
 ## Configuration
 
@@ -96,6 +153,10 @@ App fault: configure a generation provider to get finalized Handoffs.
 # three-step handoff flow and every failure branch. The live section at the end is
 # skipped automatically when no Server is reachable.
 node lib/selftest.mjs
+
+# The stage 2 hooks driven the way the host drives them: registration through
+# sdk.hooks.onDecision, then a real pre-step invocation. Offline and deterministic.
+node lib/hook-probe.mjs
 
 # Real round trip through the App's own code against a live Server.
 # Provisions a Scope of its own; it never writes into a Scope it did not create.
