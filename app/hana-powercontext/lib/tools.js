@@ -30,6 +30,25 @@ export function utf8Bytes(text) {
   return typeof TextEncoder === "function" ? new TextEncoder().encode(text).length : Buffer.byteLength(text, "utf8");
 }
 
+/**
+ * Monotonic counter behind boundary Source ids.
+ *
+ * A wall-clock stamp alone is not unique: two handoffs prepared inside the same
+ * millisecond collapse onto one id, and capture treats one id with two different
+ * bodies as a hard 409 — so the second handoff of a pair would be rejected for a
+ * reason that has nothing to do with the handoff. The counter removes that within
+ * a process; `callHandoffPrepare` still retries with a fresh id if a *different*
+ * process already claimed the same stamp.
+ */
+let boundarySequence = 0;
+
+/** A unique, sortable boundary Source id: millisecond stamp + process counter. */
+export function nextBoundarySourceId() {
+  boundarySequence += 1;
+  const stamp = new Date().toISOString().replace(/[-:.TZ]/g, "").slice(0, 17);
+  return `pc-handoff-${stamp}-${String(boundarySequence).padStart(4, "0")}`;
+}
+
 function missing(value, name) {
   return typeof value !== "string" || value.trim() === ""
     ? `\`${name}\` is required and must be a non-empty string.`
@@ -45,7 +64,7 @@ function textResult(text, details) {
  * write paths state plainly that nothing was persisted, which is the first thing
  * a caller needs to know after a failed write.
  */
-function failureResult(toolName, error, { changed = false } = {}) {
+function failureResult(toolName, error, { changed = false, details = {} } = {}) {
   const lines = [`${toolName} failed: ${error.message}`];
   if (error.serverCode) lines.push(`server code: ${error.serverCode}`);
   if (error.hint) lines.push(`hint: ${error.hint}`);
@@ -63,6 +82,10 @@ function failureResult(toolName, error, { changed = false } = {}) {
       // down" without re-parsing the message text.
       serverCode: error.serverCode ?? null,
       serverDetails: error.details ?? null,
+      // Tool-specific context. For the handoff tool this carries the boundary
+      // Source id even on failure, because knowing which Source now exists is the
+      // point of a partial write.
+      ...details,
     },
   };
 }
@@ -188,14 +211,28 @@ export async function callMemoryList(sdk, config, args = {}) {
 }
 
 /**
- * POST /v1/sources/content then POST /v1/work/handoffs/prepare-current.
+ * pc_handoff_prepare — the explicit Handoff flow, in three Server calls.
  *
- * Two Server calls, one coherent outcome. The boundary must be captured as a
- * real Source before the handoff is prepared, because `prepare-current` takes the
- * Source it is handing off as a required field — a handoff built without it would
- * be a claim with nothing behind it. If the first call succeeds and the second
- * fails, that is reported as a partial write rather than as a clean failure, so
- * the caller knows a boundary Source now exists on the Server.
+ *   capture  POST /v1/sources/content   the boundary text becomes a real Source
+ *   prepare  POST /v1/handoff/prepare   Server generates an inspectable Draft
+ *   finalize POST /v1/handoff/finalize  the Draft becomes a transferable value
+ *
+ * Why this shape and not the server-driven work-contract endpoint
+ * (`/v1/work/handoffs/prepare-current`): that endpoint derives the boundary Source
+ * itself and validates the client's `source_id` against its own derivation, so
+ * pairing it with a client-captured Source is a contract mismatch — it answers
+ * HTTP 409 `source_conflict`. The explicit `prepare`/`finalize` pair takes the
+ * exact captured Source as evidence and is the supported route.
+ *
+ * The whole exchange is one tool call; `finalize` output is returned unchanged so
+ * the caller holds the real transferable carrier, not a summary of it. This does
+ * NOT commit a durable milestone — `/v1/handoff/commit` is deliberately not
+ * exposed, because a temporary transfer is not a durable one.
+ *
+ * Partial writes are named precisely. Capture, prepare and finalize each persist
+ * something, so a later failure reports exactly how far the exchange got and what
+ * now exists on the Server, rather than claiming a clean rollback that did not
+ * happen.
  */
 export async function callHandoffPrepare(sdk, config, args = {}) {
   const problem = missing(args.objective, "objective");
@@ -214,85 +251,174 @@ export async function callHandoffPrepare(sdk, config, args = {}) {
     typeof args.disposition === "string" && HANDOFF_DISPOSITIONS.includes(args.disposition)
       ? args.disposition
       : "continuable";
+  const nextAction = typeof args.next_action === "string" && args.next_action.trim() !== "" ? args.next_action.trim() : null;
 
-  // A unique, sortable boundary id. Date prefix keeps successive handoffs in
-  // order when read back from the Server.
-  const stamp = new Date().toISOString().replace(/[-:.TZ]/g, "").slice(0, 14);
-  const sourceId = `pc-handoff-${stamp}`;
+  // Unique, sortable boundary id — see nextBoundarySourceId for why a plain
+  // timestamp is not enough.
+  const sourceId = nextBoundarySourceId();
 
+  // The boundary text is what the Server's generation step reads. It carries the
+  // caller's own words; nothing here is presented as verified evidence.
   const boundary = [
     `objective: ${args.objective}`,
     stateItems.length ? `state:\n${stateItems.map((item) => `  - ${item}`).join("\n")}` : "state: (none declared)",
     `disposition: ${disposition}`,
-    typeof args.next_action === "string" && args.next_action.trim() !== ""
-      ? `next_action: ${args.next_action}`
-      : "next_action: (none declared)",
+    nextAction ? `next_action: ${nextAction}` : "next_action: (none declared)",
     omissions.length ? `omissions:\n${omissions.map((item) => `  - ${item}`).join("\n")}` : "omissions: (none declared)",
   ].join("\n\n");
 
-  const captured = await request(sdk, config, "/v1/sources/content", {
+  /**
+   * Render a failure that names exactly which steps already persisted.
+   *
+   * The Server's own message is kept verbatim, and the partial-write sentence is
+   * built as its own sentence with its own capital: appending a lowercased clause
+   * straight after a full stop produced "…disabled). the handoff boundary Source
+   * was captured…", which reads as a typo and buries the important half.
+   */
+  const partialFailure = (error, { captured, prepared }) => {
+    // A completed Server message already ends in a full stop; one that came from
+    // this client may not.
+    const serverMessage = /\.$/.test(error.message) ? error.message : `${error.message}.`;
+
+    const done = [];
+    if (captured) done.push(`the handoff boundary Source ${captured} was captured`);
+    if (prepared) done.push("a Handoff Draft was generated");
+
+    const parts = [serverMessage];
+    if (done.length) {
+      parts.push(
+        `However, ${done.join(" and ")} on the Server in scope ${scope.scopeId}, so the work is not lost — ` +
+          "no transferable Handoff was produced.",
+      );
+    }
+
+    return failureResult(
+      "pc_handoff_prepare",
+      { ...error, message: parts.join(" ") },
+      { changed: Boolean(done.length), details: { scopeId: scope.scopeId, boundarySourceId: captured ?? null, draftGenerated: Boolean(prepared) } },
+    );
+  };
+
+  /* --- step 1/3: capture the boundary as a real Source --------------------- */
+  // Bound the retry to exactly one extra attempt. It exists for one narrow case:
+  // a *different* process claimed this id with different content (capture then
+  // answers 409 source_conflict). Retrying once with a fresh id resolves that,
+  // and the bound is what keeps "capture is unhappy" from becoming a loop.
+  let captured = await request(sdk, config, "/v1/sources/content", {
     scope_id: scope.scopeId,
     source_id: sourceId,
     content: boundary,
     metadata: { captured_by: "hana-powercontext", captured_at: new Date().toISOString() },
   });
-  if (!captured.ok) return failureResult("pc_handoff_prepare", captured);
+  let usedSourceId = sourceId;
+  if (!captured.ok && captured.serverCode === "source_conflict") {
+    usedSourceId = nextBoundarySourceId();
+    captured = await request(sdk, config, "/v1/sources/content", {
+      scope_id: scope.scopeId,
+      source_id: usedSourceId,
+      content: boundary,
+      metadata: { captured_by: "hana-powercontext", captured_at: new Date().toISOString() },
+    });
+  }
+  if (!captured.ok) {
+    return failureResult("pc_handoff_prepare", captured, { details: { scopeId: scope.scopeId } });
+  }
 
-  const source = captured.data ? captured.data.source : null;
-  const realSourceId = source && source.source_id ? source.source_id : sourceId;
+  // Copy the returned Source object exactly. The Server's evidence schema wants
+  // both fields, and inventing either one is what produces a not-found citation.
+  const sourceRef = captured.data ? captured.data.source : null;
+  if (!sourceRef || !sourceRef.source_id || !sourceRef.name) {
+    return partialFailure(
+      {
+        kind: "malformed_capture",
+        message: "Capture succeeded but the Server did not return a usable Source reference.",
+        url: `${config.baseUrl}/v1/sources/content`,
+      },
+      { captured: usedSourceId },
+    );
+  }
+  const boundarySourceId = sourceRef.source_id;
 
-  const response = await request(sdk, config, "/v1/work/handoffs/prepare-current", {
+  /* --- step 2/3: ask the Server to generate an inspectable Draft ----------- */
+  const prepared = await request(sdk, config, "/v1/handoff/prepare", {
     scope_id: scope.scopeId,
-    source_id: realSourceId,
-    handoff: {
-      schema: "powercontext.current-work-handoff.v1",
-      trust: "untrusted_input",
-      objective: args.objective,
-      // Every item is recorded as a *declared* claim with no evidence: this tool
-      // cannot verify the caller's own statements, and claiming otherwise would
-      // launder unverified text into verified evidence.
-      state: (stateItems.length ? stateItems : [args.objective]).map((text) => ({
-        text,
-        basis: "declared",
-        evidence: [],
-      })),
-      disposition,
-      next_action:
-        typeof args.next_action === "string" && args.next_action.trim() !== ""
-          ? { text: args.next_action.trim(), basis: "declared", evidence: [] }
-          : null,
-      omissions,
-    },
+    objective: args.objective,
+    evidence: [{ kind: "source", source_ref: sourceRef }],
+    max_bytes: config.maxBytes,
   });
 
-  if (!response.ok) {
-    return failureResult(
-      "pc_handoff_prepare",
+  if (!prepared.ok) {
+    // The one failure that is a capability gate rather than a fault. Saying so
+    // turns an opaque 503 into a fixable setup problem.
+    if (prepared.serverCode === "handoff_generation_unavailable") {
+      return partialFailure(
+        {
+          ...prepared,
+          message:
+            `${prepared.message} Handoff Drafts are generated by the Server's model, and this Server has no generation provider configured (handoff_generation: disabled).`,
+          hint:
+            "Configure a generation provider on the PowerContext Server (a 'full' config rather than basic memory), then retry. /pc doctor reports the Server's capabilities.",
+        },
+        { captured: boundarySourceId },
+      );
+    }
+    return partialFailure(prepared, { captured: boundarySourceId });
+  }
+
+  const draft = prepared.data;
+  if (!draft || typeof draft !== "object" || Array.isArray(draft)) {
+    return partialFailure(
       {
-        ...response,
-        message:
-          `${response.message} The handoff boundary Source ${realSourceId} was already captured in scope ${scope.scopeId}, ` +
-          "so the work is not lost, but the handoff itself was not prepared.",
+        kind: "malformed_draft",
+        message: "The Server returned no usable Handoff Draft.",
+        url: `${config.baseUrl}/v1/handoff/prepare`,
       },
-      { changed: true },
+      { captured: boundarySourceId },
     );
   }
 
-  const handoff = response.data || {};
+  /* --- step 3/3: finalize the Draft into the transferable value ------------ */
+  // `draft` goes in as the Draft body itself, never wrapped in the {ok, data}
+  // envelope this client returns to its own callers.
+  const finalized = await request(sdk, config, "/v1/handoff/finalize", {
+    scope_id: scope.scopeId,
+    draft,
+  });
+  if (!finalized.ok) {
+    return partialFailure(finalized, { captured: boundarySourceId, prepared: true });
+  }
+
+  const handoff = finalized.data;
+  const statementCount = Array.isArray(draft.state) ? draft.state.length : 0;
+
   return textResult(
     [
-      `Handoff prepared in scope ${scope.scopeId}.`,
-      `boundary source: ${realSourceId}`,
-      `objective: ${args.objective}`,
-      `disposition: ${disposition}`,
-      stateItems.length ? `declared state items: ${stateItems.length}` : "declared state items: 0",
-      omissions.length ? `declared omissions: ${omissions.length}` : null,
+      `Handoff finalized in scope ${scope.scopeId}.`,
+      `boundary source: ${boundarySourceId}`,
+      `schema: ${handoff && handoff.schema ? handoff.schema : "(not reported)"}`,
+      `objective: ${draft.objective}`,
+      `disposition: ${draft.disposition}`,
+      `state statements: ${statementCount}`,
+      Array.isArray(draft.omissions) && draft.omissions.length ? `omissions: ${draft.omissions.length}` : null,
       "",
-      "Every state item is recorded as a *declared* claim with no evidence attached.",
+      "The finalized Handoff below is the transferable value. It is a temporary",
+      "transfer, not a durable commit. State statements are Server-generated from",
+      "the captured boundary and carry the citations the Server resolved.",
+      "",
+      "finalized:",
+      JSON.stringify(handoff, null, 2),
     ]
       .filter((line) => line !== null)
       .join("\n"),
-    { ok: true, scopeId: scope.scopeId, boundarySourceId: realSourceId, handoff },
+    {
+      ok: true,
+      scopeId: scope.scopeId,
+      boundarySourceId,
+      draft,
+      // The complete carrier, returned unchanged, so a caller can hand it on
+      // without re-deriving anything.
+      finalized: handoff,
+    },
   );
 }
 

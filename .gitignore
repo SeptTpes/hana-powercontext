@@ -18,3 +18,8 @@ powercontext-data/
 artifacts/stage0/*.json
 artifacts/stage0/*.pid
 artifacts/stage0/server.log
+# 但保留报告中直接引用的两类证据：
+#   sizing-*.json  —— REPORT-0-1 §3.3 的 maxResponseBytes 取值依据（字节数）
+#   doctor.json    —— REPORT-0-1 §1 阶段0 判据 0-1 引用的 doctor 输出
+!artifacts/stage0/sizing-*.json
+!artifacts/stage0/doctor.json

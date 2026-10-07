@@ -17,6 +17,9 @@ PORT="8099"
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --port) PORT="$2"; shift 2 ;;
+    # Evidence for a later task goes in that task's own directory; the default
+    # stays where the stage 1 record expects it.
+    --out-dir) OUT="$2"; shift 2 ;;
     -h|--help) sed -n '2,9p' "${BASH_SOURCE[0]}"; exit 0 ;;
     *) echo "unknown option: $1" >&2; exit 2 ;;
   esac

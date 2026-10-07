@@ -90,7 +90,8 @@ export function buildToolRegistrations() {
     {
       name: "pc_handoff_prepare",
       description:
-        "Capture a durable handoff boundary for the current work and return the prepared handoff. Use at the end of a work session so that a different session can continue the work. Records what you declare as unverified claims; it does not verify them.",
+        "Finalize a transferable Handoff for the current work so a different session can continue it. Runs the full explicit Handoff flow in one call: the boundary is captured as a Source, the Server generates a Draft, and the Draft is finalized into the transferable value returned in details.finalized. Records what you declare as unverified claims; the Server generates the Draft from them, so it does not verify them either. This is a temporary transfer, not a durable commit. Requires the Server to have a generation provider configured.",
+      
       parameters: {
         type: "object",
         properties: {
@@ -128,7 +129,8 @@ export function buildToolRegistrations() {
       },
       sessionPermission: {
         kind: "write",
-        description: "Captures a handoff boundary Source on the PowerContext Server.",
+        description:
+          "Captures a handoff boundary Source and finalizes a Handoff on the PowerContext Server.",
       },
       run: (sdk, config, args) => callHandoffPrepare(sdk, config, args),
     },
