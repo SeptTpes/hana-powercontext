@@ -1,0 +1,15 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" role="img" aria-label="PowerContext">
+  <title>PowerContext</title>
+  <!-- Ground: warm Hana-like field -->
+  <rect width="256" height="256" rx="56" fill="#f7f3eb"/>
+  <!-- Memory ring: the bounded recall window -->
+  <circle cx="128" cy="128" r="78" fill="none" stroke="#3b342b" stroke-width="10" stroke-linecap="round" stroke-dasharray="392 98" transform="rotate(-118 128 128)"/>
+  <!-- Context core: a power node seated at the centre of the ring -->
+  <path d="M128 70l50 58-50 58-50-58z" fill="#c8552b"/>
+  <!-- Power stroke through the core -->
+  <path d="M134 84l-22 46h18l-8 42 30-52h-19z" fill="#f7f3eb"/>
+  <!-- Three recall satellites on the ring -->
+  <circle cx="128" cy="50" r="13" fill="#3b342b"/>
+  <circle cx="196" cy="167" r="13" fill="#3b342b"/>
+  <circle cx="60" cy="167" r="13" fill="#3b342b"/>
+</svg>

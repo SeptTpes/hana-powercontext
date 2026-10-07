@@ -1,0 +1,25 @@
+{
+  "manifestVersion": 2,
+  "id": "hana-powercontext",
+  "name": "PowerContext",
+  "version": "0.1.0",
+  "description": "Bounded recall and durable handoff for this session, backed by a running PowerContext Server.",
+  "entry": "index.js",
+  "capabilities": [
+    "app/tools.expose-to-model"
+  ],
+  "icon": "assets/icon.svg",
+  "minAppVersion": "1.0.0-beta",
+  "network": {
+    "allowedHosts": [
+      "127.0.0.1"
+    ],
+    "allowLocalhost": true,
+    "methods": [
+      "GET",
+      "POST"
+    ],
+    "defaultTimeoutMs": 5000,
+    "maxResponseBytes": 131072
+  }
+}
