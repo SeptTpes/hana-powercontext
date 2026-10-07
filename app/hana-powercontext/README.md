@@ -14,7 +14,7 @@ live in the PowerContext Server. What is here is the wiring — and one guarante
 |---|---|---|
 | Tool | `pc_remember` | Write one durable memory entry into a Scope |
 | Tool | `pc_memory_list` | Read the entries in a Scope (read-only) |
-| Tool | `pc_handoff_prepare` | Capture a handoff boundary and prepare a work handoff |
+| Tool | `pc_handoff_prepare` | Finalize a transferable Handoff: capture → prepare → finalize in one call |
 | Command | `/pc` | `doctor` · `scope` · `memory` · `handoff` |
 | Command | `/powercontext` | Alias for `/pc` |
 
@@ -60,27 +60,58 @@ Pointing it at a host outside that list is refused by the host, not by this App.
 ## The trust boundary
 
 The Server returns historical context labelled as **untrusted history**, and this
-App does not launder that. Two consequences are built into the tool contracts:
+App does not launder that. Three consequences are built into the tool contracts:
 
-- `pc_handoff_prepare` records every state item as a **declared** claim with an
-  empty evidence list. It cannot verify the caller's own statements, so it does
-  not pretend to.
+- `pc_handoff_prepare` writes the caller's own words into the boundary Source and
+  lets the **Server** generate the Draft from them. Neither side verifies those
+  claims; the tool says so rather than implying otherwise.
+- `pc_handoff_prepare` performs a **temporary** transfer. It never calls
+  `/v1/handoff/commit`, which is the durable-milestone operation and belongs to an
+  explicit user request.
 - Nothing in this App writes messages, rewrites prompts, or touches a session. Its
   only power is the three tools and one command, all of which a user can revoke.
+
+### The handoff flow, and its one prerequisite
+
+`pc_handoff_prepare` runs the Server's explicit Handoff flow in three calls:
+
+```
+POST /v1/sources/content     the boundary text becomes a real Source
+POST /v1/handoff/prepare     evidence cites that exact Source; Server generates a Draft
+POST /v1/handoff/finalize    the Draft becomes the transferable value (details.finalized)
+```
+
+The middle step is **model-driven on the Server**, so it needs a generation
+provider. On a basic-memory Server — where `/v1/capabilities` reports
+`handoff_generation: false` — the tool reports a structured
+`handoff_generation_unavailable` error and states plainly that the boundary Source
+was already captured, so the work is not lost. `/pc doctor` shows the Server's
+capabilities if you need to check. This is a Server configuration matter, not an
+App fault: configure a generation provider to get finalized Handoffs.
 
 ## Development
 
 ```sh
-# Logic check, no Hana and no Server needed. The live section at the end is
+# Logic check, no Hana and no Server needed. 117 assertions, including the full
+# three-step handoff flow and every failure branch. The live section at the end is
 # skipped automatically when no Server is reachable.
 node lib/selftest.mjs
 
 # Real round trip through the App's own code against a live Server.
 # Provisions a Scope of its own; it never writes into a Scope it did not create.
+# Asserts the handoff path the Server actually owes, based on its own reported
+# handoff_generation capability.
 node lib/live-demo.mjs
 
 # Negative case: same tools, pointed at a port where nothing is listening.
 node lib/live-demo.mjs --fail-open
+
+# The handoff flow's third step, against a local Server that speaks the four
+# endpoints with a generation provider simulated. Real sockets, real payloads.
+node lib/finalize-probe.mjs
+
+# Repeated handoffs must not collide on the boundary Source id.
+node lib/burst-probe.mjs <scope-id> 10
 ```
 
 ## Validate

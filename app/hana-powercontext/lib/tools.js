@@ -10,6 +10,7 @@
  */
 
 import { request } from "./powercontext.js";
+import { counters, CACHE_TTL_MS, recallCacheSize, CAPTURE_LRU_SIZE } from "./hooks.js";
 
 export const MEMORY_KINDS = Object.freeze([
   "project-fact",
@@ -509,6 +510,82 @@ export async function commandMemory(sdk, config) {
   return lines.join("\n");
 }
 
+/**
+ * `/pc hooks` — read-only view of the stage 2 layer: the in-memory counters and
+ * the permission ledger's own answer about the two hook grants.
+ *
+ * The grant status is asked of the host (`app:capabilities`), never inferred from
+ * a local flag: only the host knows whether the user approved the hook, and this
+ * command must not appear to approve anything on the user's behalf. The probe is
+ * injected so the rendering can be tested without a host.
+ */
+export async function commandHooks(config, probeCapabilities) {
+  const lines = [
+    "PowerContext hooks (stage 2)",
+    "",
+    "switches (next invocation picks these up, no reload needed)",
+    `  prestep        ${config.prestep ? "on" : "OFF"}   (POWERCONTEXT_HANA_PRESTEP)`,
+    `  capturePrompts ${config.capturePrompts ? "ON" : "off"}   (POWERCONTEXT_HANA_CAPTURE_PROMPTS)`,
+    `  beforeStart    ${config.beforeStart ? "ON" : "off"}   (POWERCONTEXT_HANA_BEFORE_START)`,
+    `  prestepMaxBytes ${config.prestepMaxBytes} | prestepTimeoutMs ${config.prestepTimeoutMs} | captureMaxBytes ${config.captureMaxBytes}`,
+    "",
+    "counters since this App process started (counts only, no content)",
+  ];
+
+  const order = [
+    "prestep_invocations",
+    "injections",
+    "skipped_disabled",
+    "skipped_empty",
+    "skipped_no_query",
+    "skipped_error",
+    "cache_hits",
+    "cache_misses",
+    "captures",
+    "captures_duplicate",
+    "captures_failed",
+    "beforestart_invocations",
+    "beforestart_injections",
+    "beforestart_skipped",
+  ];
+  for (const key of order) {
+    lines.push(`  ${key.padEnd(24)} ${counters[key] ?? 0}`);
+  }
+  lines.push(`  ${"recall_cache_entries".padEnd(24)} ${recallCacheSize()} (ttl ${CACHE_TTL_MS / 1000}s)`);
+  lines.push(`  ${"capture_dedupe_window".padEnd(24)} ${CAPTURE_LRU_SIZE}`);
+
+  lines.push("", "hook grants (answered by the host's own ledger)");
+  if (typeof probeCapabilities !== "function") {
+    lines.push("  (unavailable in this context — the host capability query is not wired here)");
+  } else {
+    try {
+      const result = await probeCapabilities();
+      const rows = (result && result.capabilities) || [];
+      const wanted = ["app/hooks.agent-pre-step", "app/hooks.agent-before-start"];
+      for (const capability of wanted) {
+        const row = rows.find((item) => item && item.capability === capability);
+        const status = row ? row.status : "not_asked";
+        const enforcement = row ? ` (${row.enforcement})` : "";
+        // Only the host can say this; an ungranted hook is simply skipped, and
+        // the turn proceeds — which is why "not_asked" is not an error here.
+        lines.push(`  ${capability.padEnd(30)} ${status}${enforcement}`);
+      }
+      const unexpected = rows
+        .filter((item) => item && typeof item.capability === "string" && item.capability.startsWith("app/hooks."))
+        .map((item) => item.capability)
+        .filter((name) => !wanted.includes(name));
+      if (unexpected.length > 0) {
+        lines.push(`  WARNING: unexpected hook grants present: ${unexpected.join(", ")}`);
+      }
+    } catch (error) {
+      lines.push(`  (host capability query failed: ${error && error.message ? error.message : String(error)})`);
+    }
+  }
+
+  lines.push("", "This command only reads. Approving a hook grant happens in Hana's own permission UI.");
+  return lines.join("\n");
+}
+
 /** `/pc handoff` — show how to drive a handoff; it needs real work state. */
 export function commandHandoff() {
   return [
@@ -533,6 +610,7 @@ export function pcUsage() {
     "  /pc doctor    Server connectivity and readiness",
     "  /pc scope     which Scope calls will use, and why",
     "  /pc memory    memory inventory for the effective Scope",
+    "  /pc hooks     recall/capture counters and hook grant status",
     "  /pc handoff   how to drive a work handoff",
     "",
     "Nothing here writes to the Server.",

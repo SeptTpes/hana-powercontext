@@ -27,6 +27,7 @@
 import { resolveConfig } from "./config.js";
 import { callRemember, callMemoryList, callHandoffPrepare, commandDoctor } from "./tools.js";
 import { probe } from "./powercontext.js";
+import { registerHooks, counters, resetCounters, resetCaptureDedupe, resetLastQuery, clearRecallCache, lastUserIndex, RECALL_PREFIX, RECALL_SUFFIX } from "./hooks.js";
 
 function argValue(flag, fallback) {
   const index = process.argv.indexOf(flag);
@@ -45,7 +46,13 @@ function liveSdk(url) {
     dataDir: null,
     network: {
       async fetch(target, init) {
-        calls.push({ target, method: (init && init.method) || "GET" });
+        // Record the body too: the stage 2 checks assert on what the hook asked
+        // the Server for, not just that it asked.
+        calls.push({
+          target,
+          method: (init && init.method) || "GET",
+          body: init && typeof init.body === "string" ? init.body : undefined,
+        });
         const response = await fetch(target, { ...init, body: init.body });
         // fetch() reads the body once; the client expects a Response, so hand the
         // same object through and let it read.
@@ -54,6 +61,28 @@ function liveSdk(url) {
     },
     calls,
   };
+}
+
+/**
+ * Register the stage 2 hooks through the SDK door, exactly as index.js does, and
+ * hand back the pre-step adjudicator. This is the harness: the hook goes in the
+ * way the App installs it, and comes out the way the host would call it.
+ */
+async function registerPreStep(sdk, configOverrides = {}) {
+  resetCounters();
+  resetCaptureDedupe();
+  resetLastQuery();
+  clearRecallCache();
+  const registered = new Map();
+  sdk.hooks = {
+    onDecision(word, adjudicator) {
+      registered.set(word, adjudicator);
+      return () => registered.delete(word);
+    },
+  };
+  const configNow = () => resolveConfig(sdk, { baseUrl, timeoutMs: failOpenMode ? 3000 : 5000, ...configOverrides });
+  await registerHooks(sdk, configNow, () => {});
+  return { preStep: registered.get("agent/pre-step"), beforeStart: registered.get("agent/before-start"), configNow };
 }
 
 const label = failOpenMode ? "FAIL-OPEN (nothing listening)" : "LIVE";
@@ -114,6 +143,30 @@ if (failOpenMode) {
   const remembered = report("pc_remember", await callRemember(sdk, config, { text: "must not be written", scope_id: scopeId }), { expectError: true });
   const listed = report("pc_memory_list", await callMemoryList(sdk, config, { scope_id: scopeId }), { expectError: true });
   const handoff = report("pc_handoff_prepare", await callHandoffPrepare(sdk, config, { objective: "must not be prepared", scope_id: scopeId }), { expectError: true });
+
+  // The stage 2 hook, against a dead Server. It must return undefined — the host
+  // reads that as "no change" — and must do so in bounded time with one attempt.
+  const hookSdk = liveSdk(baseUrl);
+  const { preStep } = await registerPreStep(hookSdk);
+  const hookStarted = Date.now();
+  let hookThrew = null;
+  let hookDecision;
+  try {
+    hookDecision = await preStep({
+      messages: [{ role: "user", content: "does pre-step degrade cleanly?" }],
+      session: { sessionId: "fail-open", sessionPath: "/tmp/fail-open" },
+    });
+  } catch (error) {
+    hookThrew = error;
+  }
+  const hookElapsed = Date.now() - hookStarted;
+  console.log("--- agent/pre-step hook — " + (hookThrew === null && hookDecision === undefined ? "as expected" : "UNEXPECTED") + " ---");
+  console.log(`decision: ${hookDecision === undefined ? "undefined (no rewrite)" : JSON.stringify(hookDecision).slice(0, 200)}`);
+  console.log(`threw:    ${hookThrew ? hookThrew.message : "no"}`);
+  console.log(`elapsed:  ${hookElapsed} ms; requests attempted: ${hookSdk.calls.length}`);
+  console.log();
+  if (hookThrew !== null || hookDecision !== undefined) failed += 1;
+
   const doctor = await commandDoctor(sdk, config, probe);
   console.log("--- /pc doctor ---");
   console.log(doctor);
@@ -124,6 +177,10 @@ if (failOpenMode) {
   console.log(`requests actually attempted: ${sdk.calls.length} (must be 4 — one per call, no retries)`);
   console.log();
   const checks = [
+    ["pre-step hook returned undefined (no rewrite)", hookDecision === undefined],
+    ["pre-step hook did not throw", hookThrew === null],
+    ["pre-step hook made exactly one attempt (no retry storm)", hookSdk.calls.length === 1, hookSdk.calls.length],
+    ["pre-step hook stayed inside its timeout budget", hookElapsed < 3000 + 1500, hookElapsed],
     ["pc_remember degraded to an error result", remembered.isError],
     ["pc_memory_list degraded to an error result", listed.isError],
     ["pc_handoff_prepare degraded to an error result", handoff.isError],
@@ -204,6 +261,53 @@ if (failOpenMode) {
   console.log(doctor);
   console.log();
 
+  /* --- stage 2: the pre-step hook, against the real Server ---------------- */
+  // This is the stage's core claim: with no tool call and no explicit query, a
+  // model step gets the previously remembered content injected automatically.
+  const hookSdk = liveSdk(baseUrl);
+  const { preStep, configNow: hookConfig } = await registerPreStep(hookSdk, { scopeId: demoScope });
+  const hookMessages = [
+    { role: "system", content: "You are a careful assistant." },
+    { role: "user", content: "remind me what the live demo wrote earlier" },
+  ];
+  const hookStarted = Date.now();
+  const decision = await preStep({ messages: hookMessages, session: { sessionId: "live", sessionPath: "/tmp/hana-powercontext-live" } });
+  const hookElapsed = Date.now() - hookStarted;
+  const injected = decision && Array.isArray(decision.messages) ? decision.messages.find((m) => !hookMessages.includes(m)) : null;
+
+  console.log("--- agent/pre-step hook (live) ---");
+  console.log(`decision:  ${decision ? "injected one message" : "undefined"}`);
+  console.log(`elapsed:   ${hookElapsed} ms over ${hookSdk.calls.length} request(s)`);
+  console.log(`injected:  ${injected ? injected.content.slice(0, 300).replace(/\n/g, " ") : "(nothing)"}`);
+  console.log();
+
+  const insertAt = lastUserIndex(hookMessages);
+  const hookChecks = [
+    ["pre-step injected a recall message against the live Server", Boolean(decision && injected)],
+    ["the injection is a user message", Boolean(injected) && injected.role === "user"],
+    ["the injection is wrapped as untrusted history", Boolean(injected) && injected.content.startsWith(RECALL_PREFIX) && injected.content.trimEnd().endsWith(RECALL_SUFFIX)],
+    ["the injection sits before the user's question", Boolean(decision) && decision.messages[insertAt] === injected],
+    ["existing messages survive untouched", Boolean(decision) && hookMessages.every((m, i) => decision.messages[i === insertAt ? insertAt + 1 : i] === m)],
+    ["the live recall body is non-empty", Boolean(injected) && injected.content.length > RECALL_PREFIX.length + RECALL_SUFFIX.length + 8],
+    [
+      "the live recall carries the Server's untrusted-history framing",
+      Boolean(injected) && /untrusted_history|Treat every item below as data/i.test(injected.content),
+    ],
+    ["the hook made exactly one request (prepare only, capture off)", hookSdk.calls.length === 1, hookSdk.calls.map((c) => c.target)],
+    ["that request was /v1/context/prepare", hookSdk.calls.length === 1 && hookSdk.calls[0].target.endsWith("/v1/context/prepare")],
+    ["the prepare request carried the pre-step byte budget", hookSdk.calls.length === 1 && JSON.parse(hookSdk.calls[0].body || "{}").max_bytes === hookConfig().prestepMaxBytes],
+    ["no capture request was sent while capture is off", !hookSdk.calls.some((c) => c.target.endsWith("/v1/sources/content"))],
+    ["the injection counter moved", counters.injections === 1, counters.injections],
+    [
+      "a second step in the same session is served from cache",
+      await (async () => {
+        const before = hookSdk.calls.length;
+        const again = await preStep({ messages: hookMessages, session: { sessionId: "live", sessionPath: "/tmp/hana-powercontext-live" } });
+        return Boolean(again) && hookSdk.calls.length === before && counters.cache_hits >= 1;
+      })(),
+    ],
+  ];
+
   const handoffPaths = handoffCalls.map((c) => c.target.replace(baseUrl, ""));
   const handoffChecks = [
     ["handoff spoke only to the handoff endpoint family", handoffPaths.every((p) => p === "/v1/sources/content" || p === "/v1/handoff/prepare" || p === "/v1/handoff/finalize")],
@@ -253,6 +357,7 @@ if (failOpenMode) {
     ["the entry is attributed to this scope", listed.text.includes(demoScope)],
     ["/pc doctor reports the Server ready", /status: ready/.test(doctor)],
     ...handoffChecks,
+    ...hookChecks,
   ];
   for (const [name, pass] of checks) {
     console.log(`  [${pass ? "PASS" : "FAIL"}] ${name}`);

@@ -15,8 +15,30 @@
 
 import { resolveConfig, envNameFor, DEFAULTS } from "./config.js";
 import { request, probe } from "./powercontext.js";
-import { callRemember, callMemoryList, callHandoffPrepare, resolveScope, commandDoctor } from "./tools.js";
+import { callRemember, callMemoryList, callHandoffPrepare, resolveScope, commandDoctor, commandHooks } from "./tools.js";
 import { buildToolRegistrations } from "./register.js";
+import {
+  messageText,
+  lastUserIndex,
+  wrapRecall,
+  truncateToBytes,
+  injectBeforeLastUser,
+  queryFromMessages,
+  sessionKeyOf,
+  contentHash,
+  captureWasSeen,
+  resetCaptureDedupe,
+  nextCaptureSourceId,
+  clearRecallCache,
+  recallCacheSize,
+  counters,
+  resetCounters,
+  RECALL_PREFIX,
+  RECALL_SUFFIX,
+  QUERY_MAX_CHARS,
+  CAPTURE_LRU_SIZE,
+  CACHE_TTL_MS,
+} from "./hooks.js";
 
 let failures = 0;
 let checks = 0;
@@ -447,6 +469,195 @@ section("handoff: negative paths keep the failure structured");
   const rBadSource = await callHandoffPrepare(badSource.sdk, negativeConfig(badSource.sdk), { objective: "obj" });
   check("a source object missing 'name' is refused", rBadSource.isError === true && /did not return a usable Source reference/.test(textOf(rBadSource)), textOf(rBadSource));
   check("no evidence request is sent with a bad source", !badSource.calls.some((c) => c.url.endsWith("/v1/handoff/prepare")), badSource.calls.map((c) => c.url));
+}
+
+/* ---------------------------------------------------- stage 2: config -- */
+
+section("stage 2 config surface");
+{
+  const sdk = stubSdk(() => jsonResponse(200, {})).sdk;
+
+  const defaults = resolveConfig(sdk, {});
+  check("prestep defaults ON (injection is the point of the App)", defaults.prestep === true, defaults.prestep);
+  check("capture defaults OFF (it writes prompts to the Server)", defaults.capturePrompts === false, defaults.capturePrompts);
+  check("before-start defaults OFF (needs a generation provider)", defaults.beforeStart === false, defaults.beforeStart);
+  check("prestepMaxBytes defaults to 8192", defaults.prestepMaxBytes === 8192, defaults.prestepMaxBytes);
+  check("prestepTimeoutMs defaults to 2000", defaults.prestepTimeoutMs === 2000, defaults.prestepTimeoutMs);
+  check("captureMaxBytes defaults to 4096", defaults.captureMaxBytes === 4096, defaults.captureMaxBytes);
+
+  check("env name mapping for prestepMaxBytes", envNameFor("prestepMaxBytes") === "POWERCONTEXT_HANA_PRESTEP_MAX_BYTES", envNameFor("prestepMaxBytes"));
+  check("env name mapping for prestepTimeoutMs", envNameFor("prestepTimeoutMs") === "POWERCONTEXT_HANA_PRESTEP_TIMEOUT_MS", envNameFor("prestepTimeoutMs"));
+  check("env name mapping for capturePrompts", envNameFor("capturePrompts") === "POWERCONTEXT_HANA_CAPTURE_PROMPTS", envNameFor("capturePrompts"));
+  check("env name mapping for captureMaxBytes", envNameFor("captureMaxBytes") === "POWERCONTEXT_HANA_CAPTURE_MAX_BYTES", envNameFor("captureMaxBytes"));
+  check("env name mapping for beforeStart", envNameFor("beforeStart") === "POWERCONTEXT_HANA_BEFORE_START", envNameFor("beforeStart"));
+
+  check("a boolean override turns the kill-switch off", resolveConfig(sdk, { prestep: false }).prestep === false);
+  check("a boolean override turns capture on", resolveConfig(sdk, { capturePrompts: true }).capturePrompts === true);
+
+  const prev = process.env.POWERCONTEXT_HANA_PRESTEP;
+  process.env.POWERCONTEXT_HANA_PRESTEP = "false";
+  check("the kill-switch is reachable from the environment", resolveConfig(sdk, {}).prestep === false);
+  process.env.POWERCONTEXT_HANA_PRESTEP = "on";
+  check("environment booleans accept 'on'", resolveConfig(sdk, {}).prestep === true);
+  // A typo must not silently read as "off" — that would hide a broken switch.
+  process.env.POWERCONTEXT_HANA_PRESTEP = "maybe";
+  check("an unparseable boolean is rejected, not guessed", resolveConfig(sdk, {}).prestep === true, resolveConfig(sdk, {}).prestep);
+  if (prev === undefined) delete process.env.POWERCONTEXT_HANA_PRESTEP;
+  else process.env.POWERCONTEXT_HANA_PRESTEP = prev;
+
+  const numeric = process.env.POWERCONTEXT_HANA_PRESTEP_MAX_BYTES;
+  process.env.POWERCONTEXT_HANA_PRESTEP_MAX_BYTES = "16384";
+  check("numeric env override applies", resolveConfig(sdk, {}).prestepMaxBytes === 16384);
+  if (numeric === undefined) delete process.env.POWERCONTEXT_HANA_PRESTEP_MAX_BYTES;
+  else process.env.POWERCONTEXT_HANA_PRESTEP_MAX_BYTES = numeric;
+}
+
+/* ------------------------------------------- stage 2: message plumbing -- */
+
+section("stage 2 message plumbing");
+{
+  check("string content is read directly", messageText({ role: "user", content: "hello" }) === "hello");
+  check(
+    "array content flattens its text parts",
+    messageText({ role: "user", content: [{ type: "text", text: "a" }, { type: "text", text: "b" }] }) === "a\nb",
+    messageText({ role: "user", content: [{ type: "text", text: "a" }, { type: "text", text: "b" }] }),
+  );
+  check(
+    "non-text parts contribute nothing",
+    messageText({ role: "user", content: [{ type: "image", data: "AAAA", mimeType: "image/png" }] }) === "",
+  );
+  check("a null message reads as empty", messageText(null) === "");
+  check("a message with no content reads as empty", messageText({ role: "user" }) === "");
+
+  const list = [{ role: "system" }, { role: "user" }, { role: "assistant" }, { role: "user" }];
+  check("the last user message is found", lastUserIndex(list) === 3, lastUserIndex(list));
+  check("no user message yields -1", lastUserIndex([{ role: "system" }]) === -1);
+  check("a non-array yields -1", lastUserIndex("nope") === -1);
+
+  const { query, index } = queryFromMessages([{ role: "user", content: "  spaced  " }]);
+  check("the query is trimmed", query === "spaced", query);
+  check("the query reports its message index", index === 0, index);
+
+  const long = queryFromMessages([{ role: "user", content: "z".repeat(4000) }]);
+  check("an over-long query is capped", long.query.length === QUERY_MAX_CHARS, long.query.length);
+
+  const multi = queryFromMessages([{ role: "user", content: "first" }, { role: "assistant" }, { role: "user", content: "second" }]);
+  check("the LAST user message wins, not the first", multi.query === "second", multi.query);
+
+  check("the session key prefers sessionPath", sessionKeyOf({ sessionId: "i", sessionPath: "/p" }) === "/p");
+  check("a bridge session (no path) falls back to its id", sessionKeyOf({ sessionId: "i", sessionPath: null }) === "id:i");
+  check("no session identity is reported as anonymous", sessionKeyOf(null) === "anonymous");
+}
+
+section("stage 2 byte accounting");
+{
+  check("under budget is returned unchanged", truncateToBytes("abc", 10) === "abc");
+  check("empty budget yields empty", truncateToBytes("abc", 0) === "");
+  check("ascii truncates to the byte count", truncateToBytes("abcdef", 3) === "abc");
+  // Multi-byte characters must never be cut in half: a broken byte sequence would
+  // reach the model as a replacement character.
+  const cjk = "中文测试内容";
+  const cut = truncateToBytes(cjk, 7);
+  check("a multi-byte string truncates without splitting a character", Buffer.byteLength(cut, "utf8") <= 7, { cut, bytes: Buffer.byteLength(cut, "utf8") });
+  check("the truncated string is still valid UTF-8", !cut.includes("\uFFFD"), cut);
+  const emoji = "😀😀😀😀";
+  const cutEmoji = truncateToBytes(emoji, 9);
+  check("a surrogate pair is never split", Buffer.byteLength(cutEmoji, "utf8") <= 9 && [...cutEmoji].every((c) => c === "😀"), { cutEmoji, bytes: Buffer.byteLength(cutEmoji, "utf8") });
+  check("an exact-fit multi-byte string is untouched", truncateToBytes("中文", 6) === "中文");
+
+  const wrapped = wrapRecall("body");
+  check("the wrapper opens with the trust marker", wrapped.startsWith(RECALL_PREFIX));
+  check("the wrapper closes with the end marker", wrapped.endsWith(RECALL_SUFFIX));
+  check("the wrapper keeps the body between the markers", wrapped.includes("body"));
+
+  const injected = injectBeforeLastUser([{ role: "user", content: "q" }], "recall", 100);
+  check("injection produces a user message", injected.messages[0].role === "user", injected.messages[0].role);
+  check("injection places recall before the user's question", injected.messages[1].content === "q", injected.messages.map((m) => m.content));
+
+  const big = injectBeforeLastUser([{ role: "user", content: "q" }], "R".repeat(5000), 100);
+  check(
+    "an oversized recall is truncated to the budget plus wrapper allowance",
+    Buffer.byteLength(big.messages[0].content, "utf8") <= 100 + 1024,
+    Buffer.byteLength(big.messages[0].content, "utf8"),
+  );
+  check("truncation still closes the wrapper", big.messages[0].content.endsWith(RECALL_SUFFIX));
+  check("truncation reports itself", big.truncated === true, big.truncated);
+
+  const noUser = injectBeforeLastUser([{ role: "assistant", content: "a" }], "recall", 100);
+  check("with no user message the recall is appended, not dropped", noUser.messages.length === 2 && noUser.messages[1].role === "user");
+}
+
+section("stage 2 capture helpers");
+{
+  resetCaptureDedupe();
+  const hash = contentHash("a prompt");
+  check("hashing is stable", contentHash("a prompt") === hash);
+  check("different text hashes differently", contentHash("other") !== hash);
+  check("the first sighting is new", captureWasSeen(hash) === false);
+  check("the second sighting is a duplicate", captureWasSeen(hash) === true);
+  check("an evicted entry becomes new again", (() => {
+    resetCaptureDedupe();
+    const first = contentHash("first");
+    captureWasSeen(first);
+    for (let i = 0; i < CAPTURE_LRU_SIZE; i += 1) captureWasSeen(contentHash(`filler-${i}`));
+    return captureWasSeen(first) === false;
+  })());
+  resetCaptureDedupe();
+
+  const id = nextCaptureSourceId();
+  check("capture ids use the pc-capture shape", /^pc-capture-\d{17}-\d{4}$/.test(id), id);
+  check("capture ids advance", nextCaptureSourceId() !== id);
+}
+
+section("stage 2 counters and /pc hooks");
+{
+  resetCounters();
+  check("counters start at zero", counters.prestep_invocations === 0 && counters.injections === 0);
+  check("every documented counter exists", [
+    "prestep_invocations", "injections", "skipped_disabled", "skipped_empty", "skipped_no_query",
+    "skipped_error", "cache_hits", "cache_misses", "captures", "captures_duplicate", "captures_failed",
+    "beforestart_invocations", "beforestart_injections", "beforestart_skipped",
+  ].every((k) => typeof counters[k] === "number"), Object.keys(counters));
+
+  const sdk = stubSdk(() => jsonResponse(200, {})).sdk;
+  const config = resolveConfig(sdk, {});
+
+  const withProbe = await commandHooks(config, async () => ({
+    capabilities: [
+      { capability: "app/hooks.agent-pre-step", status: "always", enforcement: "advisory" },
+      { capability: "app/hooks.agent-before-start", status: "not_asked", enforcement: "advisory" },
+    ],
+  }));
+  check("/pc hooks reports the pre-step switch", /prestep\s+on/.test(withProbe), withProbe);
+  check("/pc hooks reports capture as off", /capturePrompts\s+off/.test(withProbe), withProbe);
+  check("/pc hooks reports the grant status from the host", withProbe.includes("always") && withProbe.includes("not_asked"), withProbe);
+  check("/pc hooks names the cache TTL", withProbe.includes(String(CACHE_TTL_MS / 1000)), withProbe);
+
+  const offConfig = resolveConfig(sdk, { prestep: false, capturePrompts: true });
+  const offText = await commandHooks(offConfig, async () => ({ capabilities: [] }));
+  check("/pc hooks shows a disabled kill-switch in caps", /prestep\s+OFF/.test(offText), offText);
+  check("/pc hooks shows capture enabled", /capturePrompts\s+ON/.test(offText), offText);
+  check("/pc hooks handles an empty ledger", /not_asked/.test(offText), offText);
+
+  const unexpected = await commandHooks(config, async () => ({
+    capabilities: [
+      { capability: "app/hooks.agent-pre-step", status: "always", enforcement: "advisory" },
+      { capability: "app/hooks.tools-pre-execute", status: "always", enforcement: "advisory" },
+    ],
+  }));
+  check("/pc hooks warns about an out-of-scope hook grant", /WARNING: unexpected hook grants/.test(unexpected), unexpected);
+
+  const noProbe = await commandHooks(config, undefined);
+  check("/pc hooks degrades without a capability probe", /unavailable in this context/.test(noProbe), noProbe);
+
+  const brokenProbe = await commandHooks(config, async () => {
+    throw new Error("bus unavailable");
+  });
+  check("/pc hooks survives a failing probe", /host capability query failed/.test(brokenProbe), brokenProbe);
+
+  // Counters must survive a cache clear, so /pc hooks cannot be reset by traffic.
+  clearRecallCache();
+  check("clearing the cache does not reset counters", counters.prestep_invocations === 0 && recallCacheSize() === 0);
 }
 
 /* ------------------------------------------------- registration surface -- */

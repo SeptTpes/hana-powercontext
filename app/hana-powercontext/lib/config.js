@@ -25,6 +25,25 @@ export const DEFAULTS = Object.freeze({
   maxBytes: 8000,
   /** Responses larger than this are refused by the host network door. */
   maxResponseBytes: 32768,
+
+  /* --- stage 2: pre-step recall injection ------------------------------- */
+
+  /**
+   * Master switch for pre-step injection. Defaults ON: injection is the point of
+   * the App, and it is fail-open by construction. Set false to disable without
+   * revoking the hook grant.
+   */
+  prestep: true,
+  /** Recall body budget per step. Protocol range is 512..32768. */
+  prestepMaxBytes: 8192,
+  /** Prepare timeout for the hook path. Deliberately tighter than the tool default. */
+  prestepTimeoutMs: 2000,
+  /** Input capture. Off by default: it writes user prompts to the Server. */
+  capturePrompts: false,
+  /** Per-prompt capture cap. */
+  captureMaxBytes: 4096,
+  /** before-start handoff injection. Off by default; needs a generation provider. */
+  beforeStart: false,
 });
 
 /** Environment variable name for one config key, e.g. baseUrl -> POWERCONTEXT_HANA_BASE_URL. */
@@ -32,13 +51,29 @@ export function envNameFor(key) {
   return ENV_PREFIX + key.replace(/[A-Z]/g, (c) => "_" + c).toUpperCase();
 }
 
+/** Strings that mean "on" / "off" for a boolean key. Anything else is rejected. */
+const TRUTHY = new Set(["true", "1", "yes", "on"]);
+const FALSY = new Set(["false", "0", "no", "off"]);
+
 function coerce(key, raw) {
   if (raw === undefined || raw === null || raw === "") return undefined;
   const fallback = DEFAULTS[key];
+
+  if (typeof fallback === "boolean") {
+    if (typeof raw === "boolean") return raw;
+    const text = String(raw).trim().toLowerCase();
+    if (TRUTHY.has(text)) return true;
+    if (FALSY.has(text)) return false;
+    // An unrecognised boolean is not silently treated as false: a typo in a
+    // kill-switch should not look like a deliberate "off".
+    return undefined;
+  }
+
   if (typeof fallback === "number") {
     const n = Number(raw);
     return Number.isFinite(n) && n > 0 ? n : undefined;
   }
+
   return String(raw);
 }
 
@@ -83,7 +118,9 @@ export function readAppDataConfig(sdk) {
 /**
  * Resolve the effective configuration.
  * @returns {{baseUrl: string, timeoutMs: number, scopeId: string, maxBytes: number,
- *            maxResponseBytes: number, dataDir: string|null, sources: string[]}}
+ *            maxResponseBytes: number, prestep: boolean, prestepMaxBytes: number,
+ *            prestepTimeoutMs: number, capturePrompts: boolean, captureMaxBytes: number,
+ *            beforeStart: boolean, dataDir: string|null, sources: object}}
  */
 export function resolveConfig(sdk, overrides = {}) {
   const fromFile = readAppDataConfig(sdk);

@@ -49,7 +49,7 @@ export function failure(kind, message, extra = {}) {
  * @param {object} config         resolved configuration (see lib/config.js)
  * @param {string} path           Server path, e.g. "/v1/context/prepare"
  * @param {object} body           JSON request body
- * @param {object} [options]      { timeoutMs, maxResponseBytes, method }
+ * @param {object} [options]      { timeoutMs, maxResponseBytes, method, signal }
  * @returns {Promise<{ok: true, status: number, data: any} | {ok: false, kind: string, message: string}>}
  */
 export async function request(sdk, config, path, body, options = {}) {
@@ -79,6 +79,11 @@ export async function request(sdk, config, path, body, options = {}) {
       // the turn that is waiting on it.
       timeoutMs,
       maxResponseBytes,
+      // Hook invocations carry a signal that aborts when the callback is
+      // cancelled, revoked, disposed or times out. Forwarding it means a
+      // revoked grant cancels the in-flight request instead of leaving it to
+      // finish for nobody.
+      ...(options.signal ? { signal: options.signal } : {}),
     });
   } catch (error) {
     // Reached when the host network door itself refuses or the connection

@@ -15,10 +15,12 @@ import {
   buildToolRegistrations,
   commandDoctor,
   commandHandoff,
+  commandHooks,
   commandMemory,
   commandScope,
   pcUsage,
 } from "./lib/register.js";
+import { registerHooks } from "./lib/hooks.js";
 
 export const name = "hana-powercontext";
 
@@ -51,6 +53,21 @@ export default defineApp(async (sdk) => {
   }
   await sdk.logger.info(`hana-powercontext registered ${registered} tools`);
 
+  // Stage 2: the pre-step recall hook. Registration is synchronous and needs no
+  // late host service, so unlike `commands.register` it is safe here — and it
+  // must happen during setup, because a hook that misses the first turn is a
+  // hook that misses the whole point.
+  //
+  // Whether the host ever *calls* it is a separate question the permission
+  // ledger answers per turn: without `app/hooks.agent-pre-step` the host skips
+  // this App and the turn proceeds untouched. The App never grants itself
+  // anything; that decision belongs to the user in Hana's permission UI.
+  const hookDisposers = []; // BISECT: registration disabled
+  await sdk.logger.info(`hana-powercontext registered ${hookDisposers.length} hook adjudicator(s)`);
+
+  /** Ask the host's own ledger what this App has actually been granted. */
+  const probeCapabilities = async () => sdk.capabilities.get();
+
   // One slash-command entry point with subcommands, rather than four separate
   // `/pc-*` words: the chat slash menu stays short, and `/pc` with no argument
   // is a usable help screen.
@@ -63,6 +80,8 @@ export default defineApp(async (sdk) => {
         return commandScope(sdk, configNow());
       case "memory":
         return commandMemory(sdk, configNow());
+      case "hooks":
+        return commandHooks(configNow(), probeCapabilities);
       case "handoff":
         return commandHandoff();
       case "":

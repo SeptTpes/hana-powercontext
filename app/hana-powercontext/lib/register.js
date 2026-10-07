@@ -12,6 +12,7 @@ import {
   callRemember,
   commandDoctor,
   commandHandoff,
+  commandHooks,
   commandMemory,
   commandScope,
   HANDOFF_DISPOSITIONS,
@@ -19,7 +20,7 @@ import {
   pcUsage,
 } from "./tools.js";
 
-export { commandDoctor, commandHandoff, commandMemory, commandScope, pcUsage };
+export { commandDoctor, commandHandoff, commandHooks, commandMemory, commandScope, pcUsage };
 
 const MAX_MEMORY_BYTES = 8192;
 
