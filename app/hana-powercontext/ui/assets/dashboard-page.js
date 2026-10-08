@@ -1,15 +1,42 @@
 /**
- * ui/assets/dashboard-page.js — the dashboard card's wiring.
+ * ui/assets/dashboard-page.js — the dashboard card's wiring. **ES module.**
  *
  * Two jobs: render the view model from `./dashboard.js`, and remember which
  * sections the user collapsed. The fetching itself lives in
  * `./dashboard-fetch.js`, which owns the BUG-3 fix and is importable without a
  * DOM so it can be asserted offline.
  *
+ * --- BUG-4: why this file is a module now -------------------------------
+ *
+ * BUG-3 taught the card to call `hana.api.fetch`, and it still 403'd in a real
+ * card, because `globalThis.hana` **did not exist**. That global is not supplied
+ * by the host: it comes from the scaffold's local browser bridge,
+ * `ui/assets/sdk.js` (APPS.md: "轻量 HTML 可使用脚手架附带的本地
+ * ui/assets/sdk.js"). The ui tree here was hand-built in stage 3, so the bridge
+ * was simply never included — and every `hana.*` call was a silent no-op from
+ * day one. That is also why collapse state never actually persisted (B18/B23):
+ * `hana.state` was never there either.
+ *
+ * `sdk.js` is an ES module, so it is imported — a classic `<script src>` would
+ * be a syntax error on its `export` statements.
+ *
+ * --- how hana reaches the transport ------------------------------------
+ *
+ * Explicitly (option b), not by assigning a global (option a). The bridge is
+ * imported here, at the one place that owns page wiring, and handed to
+ * `loadSection`/`readCollapsed`/`writeCollapsed` through their `options`/`bridge`
+ * arguments. That keeps the dependency visible in the code that uses it and
+ * leaves `globalThis.hana` untouched — so nothing else in the App can
+ * accidentally start depending on an ambient global that only exists inside a
+ * host-mounted card. `dashboard-fetch.js` needed no change for this: it already
+ * took `options.hana` and a bridge object.
+ *
  * It never talks to the PowerContext Server. Everything Server-shaped arrives
  * through this App's own routes, which is the App backend reusing the same Scope
  * resolution, network declaration, timeout and fail-open behaviour as the tools.
  */
+
+import { hana } from "./assets/sdk.js";
 
 (function main() {
   "use strict";
@@ -19,8 +46,9 @@
   const root = document.getElementById("root");
 
   if (!view || !transport) {
-    // A missing script is a packaging error, not a runtime condition: say which
-    // one so the failure is diagnosable instead of a blank card.
+    // A missing classic script is a packaging error, not a runtime condition: say
+    // which one so the failure is diagnosable instead of a blank card. (The html's
+    // inline fallback covers the case where THIS module never runs at all.)
     root.textContent = !view
       ? "卡片脚本未加载（dashboard.js）。请重载 App。"
       : "卡片脚本未加载（dashboard-fetch.js）。请重载 App。";
@@ -57,7 +85,11 @@
   const stateBridge = {
     async get(key, fallback) {
       try {
-        if (globalThis.hana && hana.state && typeof hana.state.get === "function") {
+        // `hana` is the imported bridge, not a global. It is still probed rather
+        // than assumed: the object exists as soon as the module loads, but its
+        // `state` face may be absent outside a host-mounted card, and this page
+        // must render identically in a plain browser.
+        if (hana && hana.state && typeof hana.state.get === "function") {
           const value = await hana.state.get(key);
           return value === undefined || value === null ? fallback : value;
         }
@@ -68,7 +100,7 @@
     },
     async set(key, value) {
       try {
-        if (globalThis.hana && hana.state && typeof hana.state.set === "function") {
+        if (hana && hana.state && typeof hana.state.set === "function") {
           await hana.state.set(key, value);
         }
       } catch {
@@ -89,7 +121,9 @@
    */
   function load(section) {
     return transport.loadSection(section, {
-      hana: globalThis.hana,
+      // The imported bridge, passed explicitly. See the header: this is why the
+      // transport never has to read a global.
+      hana,
       rawPath: routesBase + "/" + section,
       fetchImpl: typeof fetch === "function" ? fetch : null,
     });
@@ -269,7 +303,7 @@
 
     // If the host re-mounts or restores this card, re-render from the same data
     // rather than fetching again.
-    if (globalThis.hana && hana.lifecycle && typeof hana.lifecycle.onVisible === "function") {
+    if (hana && hana.lifecycle && typeof hana.lifecycle.onVisible === "function") {
       hana.lifecycle.onVisible(() => render());
     }
   })();

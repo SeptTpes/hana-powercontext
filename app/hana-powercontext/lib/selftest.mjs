@@ -1012,11 +1012,14 @@ section("BUG-3: the card has exactly one door, and it carries credentials");
   check("the card files were actually read (non-empty)", html.length > 200 && page.length > 200 && fetchModule.length > 200, [html.length, page.length, fetchModule.length]);
   check("the page under test is the real card page", html.includes("PowerContext"), html.slice(0, 80));
 
-  // (1) The transport module must be loaded before the page that uses it.
-  const htmlFetchAt = html.indexOf("dashboard-fetch.js");
-  const htmlPageAt = html.indexOf("dashboard-page.js");
-  check("the card page loads the transport module", htmlFetchAt > -1, htmlFetchAt);
-  check("the transport loads before the wiring that uses it", htmlFetchAt > -1 && htmlPageAt > -1 && htmlFetchAt < htmlPageAt, [htmlFetchAt, htmlPageAt]);
+  // (1) The transport must be loaded before the page that uses it. Read the
+  //     `src` attributes, not a bare indexOf: the file names also appear in the
+  //     comments above the tags, which would make the comparison meaningless.
+  const srcOrder = [...html.matchAll(/<script\b[^>]*\bsrc=["']([^"']+)["'][^>]*>/g)].map((match) => match[1]);
+  const fetchAt = srcOrder.findIndex((src) => src.endsWith("dashboard-fetch.js"));
+  const pageAt = srcOrder.findIndex((src) => src.endsWith("dashboard-page.js"));
+  check("the card page loads the transport", fetchAt > -1, srcOrder);
+  check("the transport loads before the wiring that uses it", fetchAt > -1 && pageAt > -1 && fetchAt < pageAt, srcOrder);
 
   // (2) The wiring must contain no bare fetch: the credential door lives in one
   //     place, and a second call site is how the original bug would come back.
@@ -1034,9 +1037,59 @@ section("BUG-3: the card has exactly one door, and it carries credentials");
 
   // (5) Version, and the manifest is otherwise untouched by this fix.
   const manifest = JSON.parse(readAppFile("manifest.json"));
-  check("the version is 0.3.1", manifest.version === "0.3.1", manifest.version);
+  check("the version is 0.3.2", manifest.version === "0.3.2", manifest.version);
   check("the capabilities are unchanged by the fix", JSON.stringify(manifest.capabilities) === JSON.stringify(["app/tools.expose-to-model", "app/hooks.agent-pre-step", "app/hooks.agent-before-start"]), manifest.capabilities);
   check("the card contribution is unchanged by the fix", manifest.contributes.cards.length === 1 && manifest.contributes.cards[0].route === "/dashboard.html", manifest.contributes);
+
+  /* ------------------------------------------------------ BUG-4: the bridge -- */
+
+  // BUG-3 fixed the *door* (hana.api.fetch) but not the thing that installs it:
+  // `globalThis.hana` comes from the scaffold's local browser bridge,
+  // `ui/assets/sdk.js`. Without that file the whole SDK is a silent no-op —
+  // hana.api.fetch, hana.state and hana.lifecycle all simply do not exist, which
+  // is why every credential fix of the previous round still produced a 403.
+  const bridge = readAppFile("ui/assets/sdk.js");
+  check("the browser bridge asset exists and is not empty", bridge.length > 0, bridge.length);
+  check("the browser bridge is the real SDK, not a placeholder (>100KB)", bridge.length > 100000, bridge.length);
+  check("the bridge contains the official door implementation", bridge.includes("pluginApiFetch"));
+  check("the bridge knows the surface-session credential", bridge.includes("appSurfaceSession"));
+  check("the bridge is an ES module, so it must be imported, not classic-loaded", /export\s*\{/.test(bridge));
+  check("the bridge exports hana by name", /export\s*\{[\s\S]{0,200}?hana2 as hana[\s\S]{0,40}?\}/.test(bridge), "expected 'hana2 as hana' in the export list");
+
+  // The page must pull the bridge in as a module. A classic <script src> would be a
+  // syntax error, and no import at all means no hana — the original defect.
+  check("the card page imports the bridge as a module", /import\s*\{[^}]*\bhana\b[^}]*\}\s*from\s*["']\.\/assets\/sdk\.js["']/.test(page), page.slice(0, 200));
+  check("the card page is loaded as type=module", /<script[^>]*type=["']module["'][^>]*src=["'][^"']*dashboard-page\.js["']/.test(html), html.slice(-500));
+  check("the page does not classic-load the bridge (that would be a syntax error)", !/<script(?![^>]*type=["']module["'])[^>]*src=["'][^"']*sdk\.js["']/.test(html));
+  // Order must be read from the actual `src` attributes: a naive indexOf also
+  // matches the file names as they appear in the explanatory comments above them.
+  const scriptSrcs = [...html.matchAll(/<script\b[^>]*\bsrc=["']([^"']+)["'][^>]*>/g)].map((match) => match[1]);
+  const indexOfSrc = (name) => scriptSrcs.findIndex((src) => src.endsWith(name));
+  check("the view logic is loaded before its wiring", indexOfSrc("dashboard.js") > -1 && indexOfSrc("dashboard.js") < indexOfSrc("dashboard-page.js"), scriptSrcs);
+  check("the transport is loaded before its wiring", indexOfSrc("dashboard-fetch.js") > -1 && indexOfSrc("dashboard-fetch.js") < indexOfSrc("dashboard-page.js"), scriptSrcs);
+  check("the bridge is never loaded as a classic script tag", indexOfSrc("sdk.js") === -1, scriptSrcs);
+  check("the wiring is the only module script tag", [...html.matchAll(/<script\b([^>]*)>/g)].filter((m) => /type=["']module["']/.test(m[1])).length === 1, "expected exactly one type=module script");
+
+  // The fallback must exist inline (before any module), so a module that fails to
+  // load still has someone to say so. This is the scaffold's starter pattern.
+  check("an inline startup fallback exists in the page", /addEventListener\(\s*["']error["']/.test(html), "expected window.addEventListener('error', ...)");
+  check("the fallback is a classic script, not a module (it must run even if modules fail)", /<script>\s*window\.addEventListener\(\s*["']error["']/.test(html), html.slice(0, 1000));
+  check("the fallback tells the reader to check App resources", /检查 App 资源|Check its resources/.test(html));
+  check("the fallback names the reopen/reload remedy", /重开卡片|重载 App|reopen the card|reload the App/i.test(html), html.slice(0, 1000));
+
+  // The startup message must target an element that actually exists, or the
+  // fallback would throw on the very path it exists to cover.
+  check("the startup target element exists in the page", /id=["']boot-headline["']/.test(html), "expected #boot-headline");
+  check("the fallback's detail target also exists", /id=["']boot-detail["']/.test(html), "expected #boot-detail");
+  check("the startup message is still the connecting skeleton", /正在连接/.test(html));
+
+  // Route (b), asserted so a later "simplification" cannot quietly undo it: the
+  // bridge is threaded explicitly, and no code reads an ambient global for it.
+  const pageCode = page.replace(/\/\*[\s\S]*?\*\//g, "").split("\n").filter((line) => !/^\s*\//.test(line)).join("\n");
+  check("no code reads globalThis.hana (route b keeps the global untouched)", !/globalThis\.hana/.test(pageCode), "route (b) was chosen: thread the imported bridge explicitly");
+  check("the imported bridge is handed to the transport", /hana,/.test(pageCode) && /loadSection\(/.test(pageCode), "expected options.hana: hana");
+  check("the state bridge uses the imported binding, not a global", /if \(hana && hana\.state/.test(pageCode), pageCode.slice(0, 200));
+  check("the page never assigns a global hana", !/globalThis\.hana\s*=/.test(pageCode));
 }
 
 section("BUG-3: route failures and Server outages are never confused");

@@ -27,6 +27,19 @@ const require = createRequire(import.meta.url);
 const view = require("../ui/assets/dashboard.js");
 const transport = require("../ui/assets/dashboard-fetch.js");
 
+// Raw text of the card's own files. BUG-4 was a *missing file and a missing
+// import* — a class of defect no amount of view-logic testing can see, so the
+// wiring is asserted as text too.
+const fs = require("node:fs");
+const path = require("node:path");
+const uiDir = path.join(path.dirname(new URL(import.meta.url).pathname), "..", "ui");
+const readUi = (relative) => fs.readFileSync(path.join(uiDir, relative), "utf8");
+const htmlSource = readUi("dashboard.html");
+const pageSource = readUi("assets/dashboard-page.js");
+const bridgeSource = readUi("assets/sdk.js");
+/** `src` attributes in document order — a bare indexOf would match comments. */
+const scriptSrcs = [...htmlSource.matchAll(/<script\b[^>]*\bsrc=["']([^"']+)["'][^>]*>/g)].map((m) => m[1]);
+
 let failures = 0;
 let checks = 0;
 function check(label, condition, detail) {
@@ -557,6 +570,104 @@ section("B18: collapsed sections survive a remount");
   // so the page stays in control of what a failure means. Assert the page's
   // contract instead: a throw here must not be able to blank the card.
   check("a broken bridge surfaces to the caller (the page decides)", brokenThrew !== null, brokenThrew && brokenThrew.message);
+}
+
+/* ------------------------------ BUG-4: the hana browser bridge (sdk.js) -- */
+
+section("BUG-4: the card imports the hana browser bridge as a module");
+{
+  // The defect: `globalThis.hana` never existed in the card iframe, because the
+  // scaffold's local bridge was never included. Every hana.* call was a silent
+  // no-op, which is why fixing the credential *door* (BUG-3) still 403'd.
+  check("the bridge asset is present and substantive", bridgeSource.length > 100000, bridgeSource.length);
+  check("the bridge implements the official door", bridgeSource.includes("pluginApiFetch"));
+  check("the bridge reads the surface-session credential", bridgeSource.includes("appSurfaceSession"));
+  check("the bridge exports hana by name", /export\s*\{[\s\S]{0,200}?hana2 as hana/.test(bridgeSource));
+
+  check("the page imports the bridge from ./assets/sdk.js", /import\s*\{\s*hana\s*\}\s*from\s*["']\.\/assets\/sdk\.js["']/.test(pageSource), pageSource.slice(0, 120));
+  check("the import is a static top-level import (not dynamic)", !/import\s*\(/.test(pageSource.split("import { hana }")[0]), "expected no dynamic import before the bridge import");
+
+  // A classic <script src> of an ES module is a syntax error — assert the page
+  // never does it, and that the wiring really is type=module.
+  check("the wiring is loaded as type=module", scriptSrcs.length > 0 && /<script[^>]*type=["']module["'][^>]*src=["'][^"']*dashboard-page\.js["']/.test(htmlSource), scriptSrcs);
+  check("the bridge is not classic-loaded", !scriptSrcs.some((src) => src.endsWith("sdk.js")), scriptSrcs);
+
+  // Classic scripts run before deferred modules, so the globals the module reads
+  // are guaranteed present. Assert the order that makes that true.
+  const idx = (name) => scriptSrcs.findIndex((src) => src.endsWith(name));
+  check("the view logic loads before the wiring", idx("dashboard.js") > -1 && idx("dashboard.js") < idx("dashboard-page.js"), scriptSrcs);
+  check("the transport loads before the wiring", idx("dashboard-fetch.js") > -1 && idx("dashboard-fetch.js") < idx("dashboard-page.js"), scriptSrcs);
+}
+
+section("BUG-4: a failed module load still says something readable");
+{
+  // Static module imports change the failure mode: if sdk.js is missing or
+  // corrupt, the wiring never runs at all and the page would sit on its
+  // "正在连接…" skeleton forever. The scaffold's starter pattern is an inline
+  // classic error handler, which must therefore exist and be classic.
+  check("an inline error handler exists", /window\.addEventListener\(\s*["']error["']/.test(htmlSource));
+  check("it is a classic script, so it survives a module failure", /<script>\s*window\.addEventListener\(\s*["']error["']/.test(htmlSource));
+  check("it runs before any module script", htmlSource.indexOf("addEventListener('error'") < htmlSource.indexOf('type="module"'), [htmlSource.indexOf("addEventListener('error'"), htmlSource.indexOf('type="module"')]);
+  check("it uses capture so it sees resource load errors", /,\s*true\s*\)/.test(htmlSource), "expected addEventListener(..., true)");
+  check("it names the resource-check remedy", /检查 App 资源/.test(htmlSource));
+  check("it names the reopen/reload remedy", /重开卡片或重载 App/.test(htmlSource));
+  check("it writes to the skeleton headline", /boot-headline/.test(htmlSource));
+  check("it writes to the skeleton detail", /boot-detail/.test(htmlSource));
+  check("the skeleton the fallback replaces actually starts as connecting", /id=["']boot-headline["'][^>]*>正在连接/.test(htmlSource), "expected the 正在连接… skeleton");
+}
+
+section("BUG-4: the bridge really exports a usable hana at runtime");
+{
+  // The strongest offline check available: actually import the bridge as a module
+  // and look at what comes out. The text assertions above prove the file is the
+  // right one; this proves it yields the API the card calls. What it still cannot
+  // prove is that a real host-minted iframe gives it a session — that is B24.
+  let bridgeModule = null;
+  let importError = null;
+  try {
+    bridgeModule = await import(new URL("../ui/assets/sdk.js", import.meta.url).href);
+  } catch (error) {
+    importError = error;
+  }
+
+  check("the bridge imports as an ES module", importError === null, importError && importError.message);
+  if (bridgeModule) {
+    check("it exports hana", typeof bridgeModule.hana === "object" && bridgeModule.hana !== null, Object.keys(bridgeModule));
+    const hana = bridgeModule.hana;
+    // This is the exact call BUG-3 introduced. If it is ever absent, the card's
+    // credential door is gone again and BUG-4 has come back.
+    check("hana.api.fetch is a function (the BUG-3 door)", typeof hana.api?.fetch === "function", typeof hana.api?.fetch);
+    check("hana.api.url is a function", typeof hana.api?.url === "function");
+    check("hana.state.get/set are functions (B18's persistence)", typeof hana.state?.get === "function" && typeof hana.state?.set === "function");
+    check("hana.assets.url is a function", typeof hana.assets?.url === "function");
+    check("hana exposes a ready handshake", typeof hana.ready === "function");
+  }
+}
+
+section("BUG-4: the page threads hana explicitly (route b)");
+{
+  // Route (b): the bridge is passed down, and no code reads an ambient global.
+  // Route (a) (assigning globalThis.hana) was rejected because it hides the
+  // dependency and lets unrelated code start relying on a global that exists only
+  // inside a host-mounted card.
+  const code = pageSource
+    .replace(/\/\*[\s\S]*?\*\//g, "")
+    .split("\n")
+    .filter((line) => !/^\s*\//.test(line))
+    .join("\n");
+
+  check("no code reads globalThis.hana", !/globalThis\.hana/.test(code), "route (b) means the global is never consulted");
+  check("the page never assigns a global hana", !/globalThis\.hana\s*=/.test(code));
+  check("the imported bridge reaches the transport", /hana,/.test(code) && /loadSection\(/.test(code));
+  check("the imported bridge reaches the state bridge", /hana\s*&&\s*hana\.state/.test(code));
+  check("the transport still accepts an injected hana", typeof transport.loadSection === "function");
+  check("an injected bridge is what the transport uses", await (async () => {
+    transport.resetCounters();
+    let used = false;
+    const stub = { api: { fetch: async () => { used = true; return new Response("{}", { status: 200 }); } } };
+    await transport.loadSection("status", { hana: stub });
+    return used && transport.counters.api_fetch === 1;
+  })());
 }
 
 console.log(`\n=== DASHBOARD PROBE: ${checks - failures}/${checks} checks passed ${failures === 0 ? "— ALL PASSED" : "— " + failures + " FAILED"} ===`);
