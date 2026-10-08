@@ -16,7 +16,7 @@
        against it in lib/selftest.mjs — a mismatch fails the suite. It is a literal
        because the page cannot read the manifest: only ui/ is served to the card, so
        there is no runtime path to the file. -->
-  <link rel="stylesheet" href="./assets/dashboard.css?v=0.3.4">
+  <link rel="stylesheet" href="./assets/dashboard.css?v=0.3.5">
 </head>
 <body>
   <main class="pc-root" id="root" aria-busy="true">
@@ -67,14 +67,14 @@
 
        dashboard-fetch.js owns the credential door (BUG-3); dashboard.js stays pure
        so both can be asserted without a DOM. -->
-  <script src="./assets/dashboard.js?v=0.3.4"></script>
-  <script src="./assets/dashboard-fetch.js?v=0.3.4"></script>
+  <script src="./assets/dashboard.js?v=0.3.5"></script>
+  <script src="./assets/dashboard-fetch.js?v=0.3.5"></script>
 
   <!-- The wiring is a MODULE because it must import the hana browser bridge.
        `sdk.js` is an ES module (package/dist/ui.js): a classic <script src> would
        be a syntax error, and without this import there is no globalThis.hana at all
        — hana.api.fetch, hana.state and hana.lifecycle all silently vanish, which is
        exactly the BUG-3/BUG-4 defect. -->
-  <script type="module" src="./assets/dashboard-page.js?v=0.3.4"></script>
+  <script type="module" src="./assets/dashboard-page.js?v=0.3.5"></script>
 </body>
 </html>

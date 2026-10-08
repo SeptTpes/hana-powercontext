@@ -1049,7 +1049,7 @@ section("BUG-3: the card has exactly one door, and it carries credentials");
 
   // (5) Version, and the manifest is otherwise untouched by this fix.
   const manifest = JSON.parse(readAppFile("manifest.json"));
-  check("the version is 0.3.4", manifest.version === "0.3.4", manifest.version);
+  check("the version is 0.3.5", manifest.version === "0.3.5", manifest.version);
   check("the capabilities are unchanged by the fix", JSON.stringify(manifest.capabilities) === JSON.stringify(["app/tools.expose-to-model", "app/hooks.agent-pre-step", "app/hooks.agent-before-start"]), manifest.capabilities);
   check("the card contribution is unchanged by the fix", manifest.contributes.cards.length === 1 && manifest.contributes.cards[0].route === "/dashboard.html", manifest.contributes);
 

@@ -40,7 +40,7 @@
 // <script src>, but it is still an asset the host may cache, and a stale bridge
 // reintroduces BUG-4 — hana.* silently missing. Keep this query equal to
 // manifest.json's version; lib/selftest.mjs asserts both against the manifest.
-import { hana } from "./sdk.js?v=0.3.4";
+import { hana } from "./sdk.js?v=0.3.5";
 
 (function main() {
   "use strict";

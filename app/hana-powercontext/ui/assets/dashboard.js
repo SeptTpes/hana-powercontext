@@ -38,7 +38,39 @@
    * The tone is what colours the strip; the point is that a user can tell at a
    * glance whether the card is showing live data or an outage, without reading.
    */
-  function describeStatus(status) {
+  /**
+   * BUG-6: normalize the transport layer's flat routeFailure shape into the
+   * wrapped shape the renderers dispatch on.
+   *
+   * `loadSection` returns a FLAT `{kind:"route_failure", status, message, hint}`
+   * on transport failure, while every renderer dispatches on
+   * `{error:{kind:...}}`. A flat object has no `.ok` field, so `!status.ok` is
+   * true and it falls through every specialized branch into the generic "down"
+   * banner — which is exactly how a 403 got painted as "连不上 Server / 地址：
+   * 未知 / start-server.sh" against a healthy Server.
+   */
+  function normalizeSectionPayload(payload) {
+    if (!payload || typeof payload !== "object") return payload;
+    if (payload.error || payload.kind !== "route_failure") return payload;
+    const { kind, status, message, hint, transport } = payload;
+    return { ok: false, error: { kind, status: status === undefined ? null : status, message, hint, transport } };
+  }
+
+  /** One metadata-only bit for the reopen branch: did the host mount this iframe
+   *  WITH the surface-session credential at all? Presence/absence only — never
+   *  the value. This splits "host did not mount a ticket" from "ticket rejected"
+   *  without exposing anything. */
+  function surfaceSessionMountState() {
+    try {
+      const q = new URLSearchParams(typeof location !== "undefined" ? location.search : "");
+      return q.has("appSurfaceSession") ? "已随挂载提供" : "缺失（宿主挂载未带票据）";
+    } catch {
+      return "无法读取";
+    }
+  }
+
+  function describeStatus(rawStatus) {
+    const status = normalizeSectionPayload(rawStatus);
     if (!status) {
       return { tone: "unknown", headline: "状态未知", detail: ["还没有从 App 后端取到状态。"], fix: null };
     }
@@ -51,7 +83,7 @@
     // was the only hint that the banner was lying. The Server was up the whole
     // time; the card simply had no credential to call its own backend.
     if (status.error && status.error.kind === "route_failure") {
-      const detail = [status.error.message];
+      const detail = [status.error.message, "凭据挂载状态：" + surfaceSessionMountState() + "（仅元数据，不含值）"];
       if (status.error.status !== null && status.error.status !== undefined) {
         detail.push("HTTP " + text(status.error.status));
       }
@@ -174,7 +206,8 @@
    * The empty case is the one that matters for a new user: it must teach the
    * action, not just say "nothing".
    */
-  function describeHandoff(section) {
+  function describeHandoff(rawSection) {
+    const section = normalizeSectionPayload(rawSection);
     if (!section) {
       return { tone: "unknown", title: "最新 Handoff", lines: ["还没有取到交接状态。"], action: null };
     }
@@ -228,7 +261,8 @@
    * `truncated` is surfaced rather than hidden, so the card never implies it is
    * showing everything when it is showing ten.
    */
-  function describeMemory(section) {
+  function describeMemory(rawSection) {
+    const section = normalizeSectionPayload(rawSection);
     if (!section) {
       return { tone: "unknown", title: "记忆", counts: [], entries: [], note: "还没有取到记忆清单。", action: null };
     }
