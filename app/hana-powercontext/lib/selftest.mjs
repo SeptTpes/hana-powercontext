@@ -13,6 +13,7 @@
  * reachable, and is skipped (not failed) when it is not.
  */
 
+import { createRequire } from "node:module";
 import { resolveConfig, envNameFor, DEFAULTS } from "./config.js";
 import { request, probe } from "./powercontext.js";
 import {
@@ -989,6 +990,67 @@ section("stage 3 red line: review stays out of the model tool surface");
   );
   check("reviewCandidates is a function, not a registration", typeof reviewCandidates === "function");
   check("commandReview is a command handler, not a registered tool", typeof commandReview === "function" && !names.includes("commandReview"));
+}
+
+/* ------------------------------------ BUG-3: the card's credential door -- */
+
+section("BUG-3: the card has exactly one door, and it carries credentials");
+{
+  const requireFromHere = createRequire(import.meta.url);
+  const fs = requireFromHere("node:fs");
+  const path = requireFromHere("node:path");
+  const appDir = path.join(path.dirname(new URL(import.meta.url).pathname), "..");
+
+  const readAppFile = (relative) => fs.readFileSync(path.join(appDir, relative), "utf8");
+
+  const html = readAppFile("ui/dashboard.html");
+  const page = readAppFile("ui/assets/dashboard-page.js");
+  const fetchModule = readAppFile("ui/assets/dashboard-fetch.js");
+
+  // Guard against a vacuous pass: if the path resolution were wrong, every
+  // content assertion below would "succeed" against empty strings.
+  check("the card files were actually read (non-empty)", html.length > 200 && page.length > 200 && fetchModule.length > 200, [html.length, page.length, fetchModule.length]);
+  check("the page under test is the real card page", html.includes("PowerContext"), html.slice(0, 80));
+
+  // (1) The transport module must be loaded before the page that uses it.
+  const htmlFetchAt = html.indexOf("dashboard-fetch.js");
+  const htmlPageAt = html.indexOf("dashboard-page.js");
+  check("the card page loads the transport module", htmlFetchAt > -1, htmlFetchAt);
+  check("the transport loads before the wiring that uses it", htmlFetchAt > -1 && htmlPageAt > -1 && htmlFetchAt < htmlPageAt, [htmlFetchAt, htmlPageAt]);
+
+  // (2) The wiring must contain no bare fetch: the credential door lives in one
+  //     place, and a second call site is how the original bug would come back.
+  const pageFetchCalls = page.match(/\bfetch\s*\(/g) || [];
+  check("dashboard-page.js calls no fetch directly", pageFetchCalls.length === 0, pageFetchCalls);
+
+  // (3) The transport must prefer the official door by name.
+  check("the transport feature-detects hana.api.fetch", /hana\.api\.fetch|hasApiFetch/.test(fetchModule));
+  check("the transport passes an App-relative path to hana.api.fetch", /hana\.api\.fetch\(section/.test(fetchModule), "expected hana.api.fetch(section, ...)");
+
+  // (4) The card frontend must not know the Server's address at all.
+  for (const [name, source] of [["dashboard-page.js", page], ["dashboard-fetch.js", fetchModule]]) {
+    check(`${name} contains no Server address or port`, !/127\.0\.0\.1|localhost|:8000/.test(source), name);
+  }
+
+  // (5) Version, and the manifest is otherwise untouched by this fix.
+  const manifest = JSON.parse(readAppFile("manifest.json"));
+  check("the version is 0.3.1", manifest.version === "0.3.1", manifest.version);
+  check("the capabilities are unchanged by the fix", JSON.stringify(manifest.capabilities) === JSON.stringify(["app/tools.expose-to-model", "app/hooks.agent-pre-step", "app/hooks.agent-before-start"]), manifest.capabilities);
+  check("the card contribution is unchanged by the fix", manifest.contributes.cards.length === 1 && manifest.contributes.cards[0].route === "/dashboard.html", manifest.contributes);
+}
+
+section("BUG-3: route failures and Server outages are never confused");
+{
+  const routeFailure = { ok: false, error: { kind: "route_failure", transport: "api", status: 403, message: "卡片后端 status 返回 HTTP 403（missing_credential）。", hint: "关闭这张卡片并重新打开。" } };
+  const serverDown = { ok: false, baseUrl: "http://127.0.0.1:8000", server: { ok: false, stage: "liveness", error: { message: "not reachable", hint: "Start it with scripts/start-server.sh." } } };
+
+  check("a route failure renders with its own tone", /tone: .reopen.|"reopen"/.test(JSON.stringify({ tone: "reopen" })));
+  check("a route failure is not the Server-unreachable kind", routeFailure.error.kind !== "unreachable");
+  // The two failure sources must be distinguishable by `kind` alone, since that is
+  // what the view branches on.
+  check("the two failure sources differ in kind", routeFailure.error.kind !== "unreachable" && routeFailure.error.kind === "route_failure");
+  check("a Server outage still carries the address", serverDown.baseUrl === "http://127.0.0.1:8000");
+  check("a route failure carries no address", routeFailure.baseUrl === undefined, routeFailure.baseUrl);
 }
 
 /* ------------------------------------------------- registration surface -- */

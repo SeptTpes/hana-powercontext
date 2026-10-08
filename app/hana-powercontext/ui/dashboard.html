@@ -19,7 +19,11 @@
     </div>
   </main>
 
+  <!-- View logic, then the credential-carrying transport, then the wiring.
+       dashboard-fetch.js owns the hana.api.fetch door (BUG-3); dashboard.js stays
+       pure so both can be asserted without a DOM. -->
   <script src="./assets/dashboard.js"></script>
+  <script src="./assets/dashboard-fetch.js"></script>
   <script src="./assets/dashboard-page.js"></script>
 </body>
 </html>

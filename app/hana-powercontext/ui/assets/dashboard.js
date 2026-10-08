@@ -42,15 +42,44 @@
     if (!status) {
       return { tone: "unknown", headline: "状态未知", detail: ["还没有从 App 后端取到状态。"], fix: null };
     }
+
+    // --- BUG-3: the card's own backend failing is NOT a Server outage ---------
+    //
+    // Three failure sources, three different things to say. Conflating the first
+    // with the second is what made BUG-3 hard to read: a 403 from the card's route
+    // rendered as "连不上 Server" with an empty 地址, and the address being empty
+    // was the only hint that the banner was lying. The Server was up the whole
+    // time; the card simply had no credential to call its own backend.
+    if (status.error && status.error.kind === "route_failure") {
+      const detail = [status.error.message];
+      if (status.error.status !== null && status.error.status !== undefined) {
+        detail.push("HTTP " + text(status.error.status));
+      }
+      detail.push("这是卡片与 App 后端之间的问题，不是 PowerContext Server 的问题。");
+      return {
+        tone: "reopen",
+        headline: "卡片后端不可达",
+        detail,
+        // No Server fix command here, on purpose: telling someone to start a
+        // Server that is already running is worse than saying nothing.
+        fix: status.error.hint || "关闭这张卡片并重新打开；若仍然如此，重载 App。",
+        showAddress: false,
+      };
+    }
+
     if (!status.ok) {
       const stage = status.server && status.server.stage === "readiness" ? "服务未就绪" : "连不上 Server";
       const error = status.server && status.server.error ? status.server.error : {};
+      // The address is only meaningful when a real payload carried one. Without
+      // it the outage line reads as incomplete, which is the honest signal.
+      const address = text(status.baseUrl);
       return {
         tone: "down",
         headline: stage,
-        detail: [error.message || "Server 没有响应。", "地址：" + text(status.baseUrl)].filter(Boolean),
+        detail: [error.message || "Server 没有响应。", address ? "地址：" + address : "地址：未知（没有从后端拿到配置）"],
         // "How do I fix it" — the thing a failure state owes the reader.
         fix: error.hint || "启动它：scripts/start-server.sh；或把 POWERCONTEXT_HANA_BASE_URL 指向别的 Server。",
+        showAddress: Boolean(address),
       };
     }
 
@@ -80,6 +109,7 @@
       headline: isReady ? "已连接" : "Server 可达但未就绪",
       detail,
       fix: null,
+      showAddress: true,
     };
   }
 
@@ -120,8 +150,11 @@
       return { tone: "unknown", title: "最新 Handoff", lines: ["还没有取到交接状态。"], action: null };
     }
     if (!section.ok) {
+      const routeFailure = section.error && section.error.kind === "route_failure";
       return {
-        tone: "down",
+        // A route failure gets its own tone so the section cannot be mistaken for
+        // a Server outage, and never tells the reader to go fix the Server.
+        tone: routeFailure ? "reopen" : "down",
         title: "最新 Handoff",
         lines: [section.error && section.error.message ? section.error.message : "取交接状态失败。"],
         action: section.error && section.error.hint ? section.error.hint : "先让 Server 恢复，再点刷新。",
@@ -158,8 +191,9 @@
       return { tone: "unknown", title: "记忆", counts: [], entries: [], note: "还没有取到记忆清单。", action: null };
     }
     if (!section.ok) {
+      const routeFailure = section.error && section.error.kind === "route_failure";
       return {
-        tone: "down",
+        tone: routeFailure ? "reopen" : "down",
         title: "记忆",
         counts: [],
         entries: [],

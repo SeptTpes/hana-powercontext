@@ -1,31 +1,38 @@
 /**
  * ui/assets/dashboard-page.js — the dashboard card's wiring.
  *
- * Three jobs: fetch the App's own backend, render the view model from
- * `./dashboard.js`, and remember which sections the user collapsed.
+ * Two jobs: render the view model from `./dashboard.js`, and remember which
+ * sections the user collapsed. The fetching itself lives in
+ * `./dashboard-fetch.js`, which owns the BUG-3 fix and is importable without a
+ * DOM so it can be asserted offline.
  *
  * It never talks to the PowerContext Server. Everything Server-shaped arrives
- * through `/api/apps/hana-powercontext/routes/{status,handoff,memory,hooks}`,
- * which is the App backend reusing the same Scope resolution, network
- * declaration, timeout and fail-open behaviour as the tools.
+ * through this App's own routes, which is the App backend reusing the same Scope
+ * resolution, network declaration, timeout and fail-open behaviour as the tools.
  */
 
 (function main() {
   "use strict";
 
   const view = globalThis.PowerContextDashboard;
+  const transport = globalThis.PowerContextDashboardFetch;
   const root = document.getElementById("root");
 
-  /** Where this App's backend lives, derived from the page's own path. */
-  const routesBase = (() => {
-    const path = location.pathname || "";
-    const marker = "/ui/";
-    const at = path.indexOf(marker);
-    // Served as /api/apps/<id>/ui/dashboard.html -> /api/apps/<id>/routes
-    if (at > -1) return path.slice(0, at) + "/routes";
-    // Anything unexpected: still same-origin, still the App's own namespace.
-    return "/api/apps/hana-powercontext/routes";
-  })();
+  if (!view || !transport) {
+    // A missing script is a packaging error, not a runtime condition: say which
+    // one so the failure is diagnosable instead of a blank card.
+    root.textContent = !view
+      ? "卡片脚本未加载（dashboard.js）。请重载 App。"
+      : "卡片脚本未加载（dashboard-fetch.js）。请重载 App。";
+    return;
+  }
+
+  /**
+   * Where the fallback path would look. Only consulted when `hana.api.fetch` is
+   * absent (older host or a plain browser); with the official door the SDK owns
+   * the prefix and this is never used.
+   */
+  const routesBase = transport.routesBaseFrom(typeof location === "object" ? location.pathname : "");
 
   /** Section keys double as the `hana.state` keys for collapse state. */
   const SECTIONS = ["handoff", "memory"];
@@ -73,40 +80,19 @@
   /* ---------------------------------------------------------------- fetch -- */
 
   /**
-   * One backend call.
+   * One backend call, through whichever door the SDK offers.
    *
-   * A non-2xx answer is still parsed and returned as data: the routes answer 200
-   * with an `ok: false` body for a failed section, so a 4xx/5xx here means the
-   * route itself is unreachable — which the caller renders as its own failure.
-   * Either way this never throws, because a throwing fetch would leave the card
-   * on "正在连接…" forever, which is the single worst failure state for a UI.
+   * `hana.api.fetch` is the documented door and the one that carries the surface
+   * credential; the bare-`fetch` fallback exists only for a host (or browser)
+   * without it. The transport module counts which one was used, so
+   * `/pc hooks`-style diagnosis and the offline probe can both see it.
    */
-  async function load(section) {
-    const url = routesBase + "/" + section;
-    try {
-      const response = await fetch(url, { headers: { accept: "application/json" } });
-      const body = await response.json().catch(() => null);
-      if (!response.ok) {
-        return {
-          ok: false,
-          error: {
-            kind: "route_error",
-            message: "后端路由 " + section + " 返回 HTTP " + response.status + "。",
-            hint: "确认 App 后端已加载；重载 App 或查看 Hana 日志。",
-          },
-        };
-      }
-      return body;
-    } catch (error) {
-      return {
-        ok: false,
-        error: {
-          kind: "route_unreachable",
-          message: "取不到后端路由 " + section + "（" + (error && error.message ? error.message : "网络错误") + "）。",
-          hint: "卡片需要 App 后端在同一 App 命名空间下可访问；重载 App 后重试。",
-        },
-      };
-    }
+  function load(section) {
+    return transport.loadSection(section, {
+      hana: globalThis.hana,
+      rawPath: routesBase + "/" + section,
+      fetchImpl: typeof fetch === "function" ? fetch : null,
+    });
   }
 
   async function loadAll() {
@@ -155,6 +141,9 @@
   function renderSection(key, model, bodyBuilder) {
     const section = el("section", "pc-section");
     section.dataset.collapsed = state.collapsed[key] ? "true" : "false";
+    // Carry the tone onto the section so a backend failure cannot look like an
+    // outage section; the stylesheet keys off this.
+    section.dataset.tone = model.tone || "ok";
 
     const head = el("div", "pc-section-head");
     head.appendChild(el("span", "pc-section-title", model.title));
@@ -167,7 +156,9 @@
       state.collapsed[key] = !state.collapsed[key];
       section.dataset.collapsed = state.collapsed[key] ? "true" : "false";
       head.setAttribute("aria-expanded", state.collapsed[key] ? "false" : "true");
-      await stateBridge.set("collapsed:" + key, state.collapsed[key]);
+      // Same unit the probe exercises, so the persistence path under test is the
+      // one the card actually runs.
+      await transport.writeCollapsed(stateBridge, key, state.collapsed[key]);
     };
     head.addEventListener("click", toggle);
     head.addEventListener("keydown", (event) => {
@@ -228,11 +219,23 @@
     const lines = el("div", "pc-footer-lines");
     for (const line of model.lines) lines.appendChild(el("div", null, line));
     if (checkedAt) lines.appendChild(el("div", "pc-timestamp", "更新于 " + checkedAt));
+    // Which door served this refresh. Silent when the official one is in use (the
+    // normal case); stated when the bare-fetch fallback took over, because that is
+    // the condition BUG-3 proved is not credential-safe in a current host.
+    const counters = transport.counters;
+    if (counters.fallbacks > 0) {
+      lines.appendChild(el("div", "pc-timestamp", "注意：本次使用了回退通道（无 hana.api.fetch），可能缺少卡片凭据。"));
+    }
     footer.appendChild(lines);
 
-    const button = el("button", "pc-refresh", state.busy ? "刷新中…" : "刷新");
+    // When the card's own backend is the thing that failed, the useful action is
+    // emphasised and named for what it does. A "刷新" that cannot succeed is a
+    // dead end; "重试" next to an explanation is a way out.
+    const reopen = state.data && state.data.status && state.data.status.error && state.data.status.error.kind === "route_failure";
+    const button = el("button", "pc-refresh", state.busy ? "刷新中…" : reopen ? "重试" : "刷新");
     button.type = "button";
     button.disabled = state.busy;
+    if (reopen) button.dataset.emphasis = "reopen";
     button.addEventListener("click", () => refresh());
     footer.appendChild(button);
     return footer;
@@ -259,9 +262,7 @@
   /* ---------------------------------------------------------------- boot -- */
 
   (async function boot() {
-    for (const key of SECTIONS) {
-      state.collapsed[key] = Boolean(await stateBridge.get("collapsed:" + key, false));
-    }
+    state.collapsed = await transport.readCollapsed(stateBridge, SECTIONS);
     // One fetch on mount. No polling: a card that polls puts a permanent load on
     // the Server for a surface the user may not even be looking at.
     await refresh();

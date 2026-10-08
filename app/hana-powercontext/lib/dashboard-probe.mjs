@@ -25,6 +25,7 @@ import { dashboardStatus, dashboardHandoff, dashboardMemory, dashboardHooks } fr
 
 const require = createRequire(import.meta.url);
 const view = require("../ui/assets/dashboard.js");
+const transport = require("../ui/assets/dashboard-fetch.js");
 
 let failures = 0;
 let checks = 0;
@@ -315,6 +316,247 @@ section("view: robustness");
   check("an unknown disposition is passed through, not dropped", view.dispositionLabel("weird") === "weird", view.dispositionLabel("weird"));
   const summary = view.summarise({ status: { ok: true, baseUrl: "x", server: { ok: true, status: "ready", checks: {} }, scope: { ok: true, scopeId: "s", source: "config" } }, memory: { ok: true, total: 7, byKind: {}, entries: [] }, handoff: { ok: true, handoff: null } });
   check("the one-line summary mentions all three sections", summary.includes("已连接") && summary.includes("7") && summary.includes("无交接"), summary);
+}
+
+/* ------------------------------------------------- BUG-3: credential door -- */
+
+section("BUG-3: the card calls its backend through the SDK's credential door");
+{
+  transport.resetCounters();
+
+  const calls = [];
+  const hanaApi = {
+    async fetch(path, init) {
+      calls.push({ path, init });
+      return new Response(JSON.stringify({ ok: true, via: "api" }), { status: 200, headers: { "content-type": "application/json" } });
+    },
+  };
+
+  const body = await transport.loadSection("status", { hana: { api: hanaApi } });
+  check("the official door was used", calls.length === 1, calls.length);
+  check("the request went through hana.api.fetch", transport.counters.api_fetch === 1, transport.counters);
+  check("no fallback was taken", transport.counters.fallbacks === 0, transport.counters);
+  check("the parsed body is returned", body && body.via === "api", body);
+
+  // The path must be App-relative: a full URL or an "api/apps..." path is rejected
+  // by the SDK's own normaliser, and a leading "/" is stripped. Passing a URL here
+  // is the mistake that would silently reintroduce a credential-less request.
+  check("the path is App-relative, not a full URL", calls[0].path === "status", calls[0].path);
+  check("the path does not start with /api/apps", !String(calls[0].path).startsWith("api/apps"), calls[0].path);
+  check("no absolute origin is passed", !/^https?:/.test(String(calls[0].path)), calls[0].path);
+  check("an accept header is requested", calls[0].init.headers.accept === "application/json", calls[0].init.headers);
+  // The App must never try to supply the surface credential itself: only the SDK
+  // may read it out of the iframe URL. If this ever appears here, the card would be
+  // shipping a credential — or, worse, guessing at one.
+  check("the credential header is named exactly as the host expects", transport.SURFACE_SESSION_HEADER === "X-Hana-App-Surface-Session", transport.SURFACE_SESSION_HEADER);
+  check("the session query key matches the SDK's", transport.SURFACE_SESSION_QUERY === "appSurfaceSession", transport.SURFACE_SESSION_QUERY);
+  check("the credential header is never set by the App itself", !(transport.SURFACE_SESSION_HEADER in calls[0].init.headers), Object.keys(calls[0].init.headers));
+  check("the App sends no credential-bearing query either", !String(calls[0].path).includes("appSurfaceSession"), calls[0].path);
+}
+
+section("BUG-3: 403 from the card backend is its own failure, not an outage");
+{
+  transport.resetCounters();
+
+  const forbidden = {
+    async fetch() {
+      return new Response(JSON.stringify({ error: "forbidden", reason: "missing_credential" }), {
+        status: 403,
+        headers: { "content-type": "application/json" },
+      });
+    },
+  };
+
+  // `loadSection` returns the route-failure descriptor ITSELF, which is what the
+  // page hands to the view as `{ ok: false, error: descriptor }` — the same shape
+  // the backend's own failures arrive in. Both halves are asserted here so the
+  // wiring between them cannot drift.
+  const failure = await transport.loadSection("handoff", { hana: { api: forbidden } });
+  check("a 403 is reported as a route failure", failure && failure.kind === "route_failure", failure);
+  check("the kind is not the Server-unreachable kind", failure.kind !== "unreachable", failure.kind);
+  check("a route failure carries no ok:true", failure.ok === undefined, failure.ok);
+  check("the transport used is recorded", failure.transport === "api", failure);
+  check("the HTTP status is recorded", failure.status === 403, failure.status);
+  check("the Server's own reason is surfaced", /missing_credential/.test(failure.message), failure.message);
+  check("the hint says to reopen the card", /关闭这张卡片并重新打开/.test(failure.hint), failure.hint);
+  check("the hint explicitly separates itself from the Server", /与 Server 是两条独立链路/.test(failure.hint), failure.hint);
+
+  // The whole point of the split: no Server repair command may appear.
+  const result = { ok: false, error: failure };
+  const rendered = view.describeStatus({ error: failure });
+  check("the rendered tone is the reopen tone, not the outage tone", rendered.tone === "reopen", rendered.tone);
+  check("the rendered headline says the card backend is unreachable", /卡片后端不可达/.test(rendered.headline), rendered.headline);
+  check("the rendered copy contains NO Server fix command", !/start-server\.sh/.test(JSON.stringify(rendered)), rendered);
+  check("the rendered copy contains no POWERCONTEXT_HANA_BASE_URL advice", !/POWERCONTEXT_HANA_BASE_URL/.test(JSON.stringify(rendered)), rendered);
+  check("the rendered copy says it is not a Server problem", /不是 PowerContext Server 的问题/.test(rendered.detail.join(" ")), rendered.detail);
+  check("the rendered copy does not render a bogus address", !rendered.detail.some((line) => /^地址：$/.test(line)), rendered.detail);
+  check("showAddress is false so the view cannot print an empty address", rendered.showAddress === false, rendered.showAddress);
+
+  // Section-level rendering must switch tone too.
+  const handoffView = view.describeHandoff({ ok: false, error: failure });
+  check("a failed handoff section is toned reopen", handoffView.tone === "reopen", handoffView.tone);
+  check("a failed handoff section does not tell the reader to fix the Server", !/先让 Server 恢复/.test(handoffView.action), handoffView.action);
+  const memoryView = view.describeMemory({ ok: false, error: failure });
+  check("a failed memory section is toned reopen", memoryView.tone === "reopen", memoryView.tone);
+}
+
+section("BUG-3: the three failure sources stay distinguishable");
+{
+  // (1) the card's own backend failed
+  const routeFailure = { ok: false, error: { kind: "route_failure", transport: "api", status: 403, message: "卡片后端 handoff 返回 HTTP 403。", hint: "关闭这张卡片并重新打开。" } };
+  check("route failure → reopen tone", view.describeStatus(routeFailure).tone === "reopen");
+
+  // (2) the Server is genuinely unreachable
+  const serverDown = {
+    ok: false,
+    baseUrl: "http://127.0.0.1:8000",
+    server: { ok: false, stage: "liveness", error: { message: "Server is not reachable.", hint: "Start it with scripts/start-server.sh." } },
+  };
+  const downView = view.describeStatus(serverDown);
+  check("Server outage → down tone", downView.tone === "down", downView.tone);
+  check("Server outage still shows the address", downView.detail.some((l) => l.includes("127.0.0.1:8000")), downView.detail);
+  check("Server outage still offers the Server fix", /start-server/.test(downView.fix), downView.fix);
+  check("Server outage marks showAddress true", downView.showAddress === true, downView.showAddress);
+
+  // The two must never render the same headline.
+  check("the two failures do not share a headline", view.describeStatus(routeFailure).headline !== downView.headline, [view.describeStatus(routeFailure).headline, downView.headline]);
+
+  // (3) the backend answered, and the backend itself says the Server is down
+  const backendSaysDown = { ok: false, server: { ok: false, stage: "liveness", error: { message: "PowerContext Server is not reachable at http://127.0.0.1:8000.", hint: "Start it with scripts/start-server.sh." } } };
+  check("backend-reported outage → down tone", view.describeStatus(backendSaysDown).tone === "down");
+
+  // A payload with no address at all must say so rather than printing "地址：".
+  const noAddress = { ok: false, server: { ok: false, stage: "liveness", error: { message: "boom" } } };
+  const noAddressView = view.describeStatus(noAddress);
+  check("a missing address is stated, not left blank", noAddressView.detail.some((l) => l === "地址：未知（没有从后端拿到配置）"), noAddressView.detail);
+  check("a missing address marks showAddress false", noAddressView.showAddress === false, noAddressView.showAddress);
+}
+
+section("BUG-3: fallback to bare fetch is counted, and only for a missing door");
+{
+  transport.resetCounters();
+  const rawCalls = [];
+  const rawFetch = async (url, init) => {
+    rawCalls.push({ url, init });
+    return new Response(JSON.stringify({ ok: true, via: "raw" }), { status: 200, headers: { "content-type": "application/json" } });
+  };
+
+  // No hana at all: the documented fallback, counted.
+  const body = await transport.loadSection("memory", { hana: null, rawPath: "/api/apps/hana-powercontext/routes/memory", fetchImpl: rawFetch });
+  check("the fallback served the request", body && body.via === "raw", body);
+  check("the fallback was counted", transport.counters.fallbacks === 1, transport.counters);
+  check("the raw fetch was counted", transport.counters.raw_fetch === 1, transport.counters);
+  check("the official door was not counted", transport.counters.api_fetch === 0, transport.counters);
+  check("the fallback used the derived routes base", String(rawCalls[0].url).includes("/api/apps/hana-powercontext/routes/memory"), rawCalls[0].url);
+
+  // A present-but-throwing official door must NOT silently fall back: a bare retry
+  // is exactly the call that produced the 403, so retrying it would hide the cause.
+  transport.resetCounters();
+  const throwing = {
+    async fetch() {
+      throw new Error("hana.api.fetch requires appSurfaceSession in the iframe URL.");
+    },
+  };
+  const failed = await transport.loadSection("status", { hana: { api: throwing }, rawPath: "/x", fetchImpl: rawFetch });
+  check("a throwing official door does not fall back", transport.counters.fallbacks === 0, transport.counters);
+  check("it is reported as a route failure", failed && failed.kind === "route_failure", failed);
+  check("the transport is named as api", failed.transport === "api", failed);
+  check("the SDK's own explanation is carried through", /appSurfaceSession/.test(failed.message), failed.message);
+  check("the raw fetch was never called", rawCalls.filter((c) => String(c.url).includes("/x")).length === 0, rawCalls.length);
+
+  // Feature detection must be about the function, not the namespace.
+  check("hasApiFetch rejects an api namespace without fetch", transport.hasApiFetch({ api: {} }) === false);
+  check("hasApiFetch accepts a callable door", transport.hasApiFetch({ api: { fetch: async () => new Response() } }) === true);
+  check("hasApiFetch rejects no hana at all", transport.hasApiFetch(null) === false);
+}
+
+section("BUG-3: routesBase derivation");
+{
+  check(
+    "a card page under the App namespace resolves to its routes base",
+    transport.routesBaseFrom("/api/apps/hana-powercontext/ui/dashboard.html") === "/api/apps/hana-powercontext/routes",
+    transport.routesBaseFrom("/api/apps/hana-powercontext/ui/dashboard.html"),
+  );
+  check(
+    "a nested page still resolves",
+    transport.routesBaseFrom("/api/apps/hana-powercontext/ui/sub/page.html") === "/api/apps/hana-powercontext/routes",
+    transport.routesBaseFrom("/api/apps/hana-powercontext/ui/sub/page.html"),
+  );
+  check("an unexpected pathname falls back to the known namespace", transport.routesBaseFrom("/something/else") === "/api/apps/hana-powercontext/routes");
+  check("an empty pathname does not throw", transport.routesBaseFrom("") === "/api/apps/hana-powercontext/routes");
+  check("undefined does not throw", transport.routesBaseFrom(undefined) === "/api/apps/hana-powercontext/routes");
+  check("a degenerate /ui/ path does not produce a broken base", transport.routesBaseFrom("/ui/x.html") === "/api/apps/hana-powercontext/routes", transport.routesBaseFrom("/ui/x.html"));
+}
+
+/* ------------------------------------------------------ B18: view state -- */
+
+section("B18: collapsed sections survive a remount");
+{
+  /** An in-memory stand-in for the host's hana.state bridge. */
+  function fakeBridge(store = new Map()) {
+    return {
+      store,
+      async get(key, fallback) {
+        return store.has(key) ? store.get(key) : fallback;
+      },
+      async set(key, value) {
+        store.set(key, value);
+      },
+    };
+  }
+
+  // First mount: nothing stored yet, everything expanded.
+  const store = new Map();
+  const first = await transport.readCollapsed(fakeBridge(store));
+  check("a fresh mount starts expanded", first.handoff === false && first.memory === false, first);
+
+  // The user collapses one section.
+  await transport.writeCollapsed(fakeBridge(store), "handoff", true);
+  check("the collapse was written under a namespaced key", store.has("collapsed:handoff"), [...store.keys()]);
+  check("the key namespaces by section", transport.collapseKey("memory") === "collapsed:memory", transport.collapseKey("memory"));
+
+  // Remount: a brand-new bridge over the same store, exactly like a fresh iframe.
+  const second = await transport.readCollapsed(fakeBridge(store));
+  check("the collapse survived the remount", second.handoff === true, second);
+  check("the untouched section stayed expanded", second.memory === false, second);
+
+  // Re-expanding must persist too, and must be distinguishable from "never set".
+  await transport.writeCollapsed(fakeBridge(store), "handoff", false);
+  const third = await transport.readCollapsed(fakeBridge(store));
+  check("re-expanding survives a remount", third.handoff === false, third);
+  check("the explicit false was actually stored", store.get("collapsed:handoff") === false, store.get("collapsed:handoff"));
+
+  // A bridge that is missing or broken must degrade, never throw.
+  let threw = null;
+  let degraded;
+  try {
+    degraded = await transport.readCollapsed(null);
+  } catch (error) {
+    threw = error;
+  }
+  check("a missing bridge does not throw", threw === null, threw && threw.message);
+  check("a missing bridge reads as expanded", degraded.handoff === false && degraded.memory === false, degraded);
+  check("writing through a missing bridge is a no-op, not a throw", (await transport.writeCollapsed(null, "handoff", true)) === false);
+
+  const broken = {
+    async get() {
+      throw new Error("state unavailable");
+    },
+    async set() {
+      throw new Error("state unavailable");
+    },
+  };
+  let brokenThrew = null;
+  try {
+    await transport.readCollapsed(broken);
+    await transport.writeCollapsed(broken, "handoff", true);
+  } catch (error) {
+    brokenThrew = error;
+  }
+  // The page wraps these in try/catch, but the unit itself is allowed to propagate
+  // so the page stays in control of what a failure means. Assert the page's
+  // contract instead: a throw here must not be able to blank the card.
+  check("a broken bridge surfaces to the caller (the page decides)", brokenThrew !== null, brokenThrew && brokenThrew.message);
 }
 
 console.log(`\n=== DASHBOARD PROBE: ${checks - failures}/${checks} checks passed ${failures === 0 ? "— ALL PASSED" : "— " + failures + " FAILED"} ===`);
