@@ -119,16 +119,16 @@ export default defineApp(async (sdk) => {
         return c.json(payload);
       };
 
-      app.get("/api/status", section("status", (resolve) => dashboardStatus(sdk, resolve)));
-      app.get("/api/handoff", section("handoff", (resolve) => dashboardHandoff(sdk, resolve)));
+      app.get("/status", section("status", (resolve) => dashboardStatus(sdk, resolve)));
+      app.get("/handoff", section("handoff", (resolve) => dashboardHandoff(sdk, resolve)));
       app.get(
-        "/api/memory",
+        "/memory",
         section("memory", (resolve, c) => {
           const limit = Number(new URL(c.req.url).searchParams.get("limit"));
           return dashboardMemory(sdk, resolve, { previewLimit: Number.isFinite(limit) && limit > 0 ? limit : 10 });
         }),
       );
-      app.get("/api/hooks", section("hooks", () => Promise.resolve(dashboardHooks())));
+      app.get("/hooks", section("hooks", () => Promise.resolve(dashboardHooks())));
     });
     await sdk.logger.info("hana-powercontext registered dashboard routes");
   } catch (error) {

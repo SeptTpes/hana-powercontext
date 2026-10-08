@@ -1049,7 +1049,7 @@ section("BUG-3: the card has exactly one door, and it carries credentials");
 
   // (5) Version, and the manifest is otherwise untouched by this fix.
   const manifest = JSON.parse(readAppFile("manifest.json"));
-  check("the version is 0.3.5", manifest.version === "0.3.5", manifest.version);
+  check("the version is 0.3.6", manifest.version === "0.3.6", manifest.version);
   check("the capabilities are unchanged by the fix", JSON.stringify(manifest.capabilities) === JSON.stringify(["app/tools.expose-to-model", "app/hooks.agent-pre-step", "app/hooks.agent-before-start"]), manifest.capabilities);
   check("the card contribution is unchanged by the fix", manifest.contributes.cards.length === 1 && manifest.contributes.cards[0].route === "/dashboard.html", manifest.contributes);
 
@@ -1205,7 +1205,7 @@ section("Fix-3: every card route is attributable in the host log");
   // All four routes must go through the logging wrapper, or one of them stays
   // invisible — and an invisible route is exactly what made the "79 requests"
   // question unanswerable.
-  const wrapped = [...indexText.matchAll(/app\.get\(\s*["']\/api\/([a-z]+)["']\s*,\s*section\(/g)].map((m) => m[1]);
+  const wrapped = [...indexText.matchAll(/app\.get\(\s*["']\/([a-z]+)["']\s*,\s*section\(/g)].map((m) => m[1]);
   check("all four dashboard routes are wrapped by the logging helper", wrapped.length === 4, wrapped);
   check("the four routes are status/handoff/memory/hooks", JSON.stringify(wrapped.sort()) === JSON.stringify(["handoff", "hooks", "memory", "status"]), wrapped);
 

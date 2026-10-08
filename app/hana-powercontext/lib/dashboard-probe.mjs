@@ -37,6 +37,7 @@ const readUi = (relative) => fs.readFileSync(path.join(uiDir, relative), "utf8")
 const htmlSource = readUi("dashboard.html");
 const pageSource = readUi("assets/dashboard-page.js");
 const bridgeSource = readUi("assets/sdk.js");
+const indexText = fs.readFileSync(path.join(path.dirname(uiDir), "index.js"), "utf8");
 /** `src` attributes in document order — a bare indexOf would match comments. */
 const scriptSrcs = [...htmlSource.matchAll(/<script\b[^>]*\bsrc=["']([^"']+)["'][^>]*>/g)].map((m) => m[1]);
 /**
@@ -596,6 +597,12 @@ section("BUG-4: the card imports the hana browser bridge as a module");
 
   // A classic <script src> of an ES module is a syntax error — assert the page
   // never does it, and that the wiring really is type=module.
+  // BUG-7 regression guard: registrar paths are /routes/-relative subpaths —
+  // an "/api/..." prefix here double-nests the URL the SDK builds and 404s.
+  const indexSource = (typeof arguments !== "undefined") ? "" : "";
+  check("registrar mounts status at /status (no /api prefix)", /routes\.register\(\(app\)\s*=>\s*\{[\s\S]*?app\.get\("\/status"/.test(indexText || ""), "index.js paths");
+  check("registrar mounts no path starting with /api/", !/app\.get\(\s*"\/api\//.test(indexText || ""), "index.js paths");
+
   check("the wiring is loaded as type=module", scriptSrcs.length > 0 && /<script[^>]*type=["']module["'][^>]*src=["'][^"']*dashboard-page\.js(\?v=[^"']*)?["']/.test(htmlSource), scriptSrcs);
   check("the bridge is not classic-loaded", !scriptSrcs.some((src) => pathnameOf(src).endsWith("sdk.js")), scriptSrcs);
 
