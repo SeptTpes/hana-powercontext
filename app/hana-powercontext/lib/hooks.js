@@ -674,7 +674,9 @@ export async function preStepDecision(sdk, config, invocation, deps = {}) {
   }
 
   // Layer 1: the verbatim last-user-message query (unchanged since stage 2).
-  const { query: rawQuery, index } = queryFromMessages(messages);
+  // Only the text is read here; the message index it reports belongs to the
+  // injection helper, which finds the insertion point itself.
+  const { query: rawQuery } = queryFromMessages(messages);
 
   // Layer 2: the retrieval-shaping pass added in stage 2B. The raw text is the
   // fallback *inside* the extractor, so the only way to arrive here with an
@@ -741,7 +743,6 @@ export async function preStepDecision(sdk, config, invocation, deps = {}) {
     }
   }
 
-  void index;
   return finishInjection(messages, recall, config, counters);
 }
 

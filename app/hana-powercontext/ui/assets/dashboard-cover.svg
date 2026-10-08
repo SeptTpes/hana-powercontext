@@ -1,0 +1,42 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 480 320" role="img" aria-label="PowerContext dashboard">
+  <title>PowerContext 看板</title>
+  <!-- Same warm field and ink as the App icon, so the card reads as the same object. -->
+  <rect width="480" height="320" fill="#f7f3eb"/>
+
+  <!-- Status strip: a live indicator plus two "connection" lines. -->
+  <rect x="40" y="36" width="400" height="52" rx="14" fill="#ffffff" stroke="#e2d9c9" stroke-width="2"/>
+  <circle cx="68" cy="62" r="11" fill="#3f8f5f"/>
+  <rect x="90" y="55" width="150" height="7" rx="3.5" fill="#3b342b"/>
+  <rect x="90" y="68" width="96" height="6" rx="3" fill="#b9ad98"/>
+  <rect x="352" y="53" width="64" height="18" rx="9" fill="#eef3ee" stroke="#3f8f5f" stroke-width="2"/>
+
+  <!-- Three recall rows: what a memory list looks like at a glance. -->
+  <rect x="40" y="108" width="400" height="130" rx="14" fill="#ffffff" stroke="#e2d9c9" stroke-width="2"/>
+  <g fill="#3b342b">
+    <circle cx="66" cy="136" r="6"/>
+    <circle cx="66" cy="172" r="6"/>
+    <circle cx="66" cy="208" r="6"/>
+  </g>
+  <g fill="#c8552b">
+    <circle cx="66" cy="136" r="6" fill="#c8552b"/>
+  </g>
+  <g fill="#cfc4b1">
+    <rect x="86" y="131" width="300" height="9" rx="4.5"/>
+    <rect x="86" y="167" width="250" height="9" rx="4.5"/>
+    <rect x="86" y="203" width="286" height="9" rx="4.5"/>
+  </g>
+
+  <!-- Bottom row: the three surfaces the card actually shows. -->
+  <g>
+    <rect x="40" y="256" width="122" height="34" rx="11" fill="#3b342b"/>
+    <rect x="179" y="256" width="122" height="34" rx="11" fill="#e6ddcd"/>
+    <rect x="318" y="256" width="122" height="34" rx="11" fill="#e6ddcd"/>
+  </g>
+  <g fill="#f7f3eb">
+    <rect x="58" y="269" width="86" height="8" rx="4"/>
+  </g>
+  <g fill="#8d8371">
+    <rect x="197" y="269" width="86" height="8" rx="4"/>
+    <rect x="336" y="269" width="86" height="8" rx="4"/>
+  </g>
+</svg>

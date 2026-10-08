@@ -15,16 +15,52 @@ live in the PowerContext Server. What is here is the wiring — and one guarante
 | Tool | `pc_remember` | Write one durable memory entry into a Scope |
 | Tool | `pc_memory_list` | Read the entries in a Scope (read-only) |
 | Tool | `pc_handoff_prepare` | Finalize a transferable Handoff: capture → prepare → finalize in one call |
-| Command | `/pc` | `doctor` · `scope` · `memory` · `hooks` · `handoff` |
+| Command | `/pc` | `doctor` · `scope` · `memory` · `hooks` · `handoff` · `review` |
 | Command | `/powercontext` | Alias for `/pc` |
 | Hook | `agent/pre-step` | **Automatic bounded recall before each model step** (stage 2) |
 | Hook | `agent/before-start` | Handoff injection at turn start — code only, default off |
+| Card | **PowerContext 看板** | Scope, latest Handoff, memory list and Server state on a Hana board |
 
 `/pc doctor` answers the one question worth answering first: is the Server there,
 and is it ready. `/pc hooks` answers the second: is recall actually firing, and
-has the user granted the hooks.
+has the user granted the hooks. The dashboard card answers both at a glance,
+without typing anything.
 
-Not in this version: the Handoff board card (stage 3).
+## The dashboard card (stage 3)
+
+A chalkboard card that makes the App's state visible instead of leaving it in a
+black box: the effective Scope, the latest Handoff, the memory inventory and the
+Server's reachability — on one surface, refreshed when you ask it to.
+
+Two design rules it follows:
+
+- **The card never talks to the PowerContext Server.** It calls this App's own
+  backend (`/api/apps/hana-powercontext/routes/{status,handoff,memory,hooks}`),
+  which reuses the same Scope resolution, network declaration, timeout and
+  fail-open behaviour as the tools. One place to get the connection right, not
+  two. The routes are read-only: nothing the card does can write to the Server.
+- **A failure explains itself.** When the Server is down the card shows what
+  happened, which address it tried, and how to fix it — instead of an empty panel
+  that looks like a bug. An empty memory list teaches `pc_remember`; an empty
+  Handoff section teaches `pc_handoff_prepare`. It also says "showing 10 of 43"
+  rather than implying it shows everything.
+
+The card fetches once when it mounts and then only when you press 刷新. It does not
+poll: a card that polls puts a permanent load on the Server for a surface you may
+not even be looking at. Collapsed/expanded sections are remembered per card
+instance through `hana.state`; the data itself is never cached, so what you see is
+what the Server said on the last refresh.
+
+## Review is a human decision (stage 3)
+
+`/pc review` lists pending Artifact Candidates and `/pc review approve|reject`
+decides them. **No review operation is exposed as a model-callable tool**, and
+none ever will be: approving a Candidate publishes a generated artifact, and a
+model that could approve its own proposals would be reviewing its own work. A
+slash command can only be typed by a person, so that is the only door.
+
+A version conflict is reported, not retried — the decision has to land on the
+revision you actually looked at.
 
 ## Automatic recall (stage 2)
 
@@ -185,6 +221,11 @@ node lib/selftest.mjs
 # The stage 2 hooks driven the way the host drives them: registration through
 # sdk.hooks.onDecision, then a real pre-step invocation. Offline and deterministic.
 node lib/hook-probe.mjs
+
+# The card's backend aggregation and its view logic — what the card says for a
+# healthy Server, an empty Scope, and an outage. The rendered page needs a host;
+# these decisions are pure functions and do not.
+node lib/dashboard-probe.mjs
 
 # Real round trip through the App's own code against a live Server.
 # Provisions a Scope of its own; it never writes into a Scope it did not create.

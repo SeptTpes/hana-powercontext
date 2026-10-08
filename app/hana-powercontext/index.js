@@ -17,10 +17,12 @@ import {
   commandHandoff,
   commandHooks,
   commandMemory,
+  commandReview,
   commandScope,
   pcUsage,
 } from "./lib/register.js";
 import { registerHooks } from "./lib/hooks.js";
+import { dashboardHooks, dashboardHandoff, dashboardMemory, dashboardStatus } from "./lib/dashboard.js";
 
 export const name = "hana-powercontext";
 
@@ -81,6 +83,35 @@ export default defineApp(async (sdk) => {
   /** Ask the host's own ledger what this App has actually been granted. */
   const probeCapabilities = async () => sdk.capabilities.get();
 
+  // Stage 3: the dashboard card's backend. One registrar, four read-only routes,
+  // all of them thin wrappers over lib/ — so the card inherits the App's network
+  // declaration, Scope resolution, timeout and fail-open behaviour rather than
+  // reimplementing a second, weaker copy of all four. The card itself never
+  // reaches the PowerContext Server.
+  //
+  // `routes.register` returns a disposer synchronously and needs no capability
+  // word, which is why adding the card changes no permission the user must grant.
+  try {
+    sdk.routes.register((app) => {
+      const json = (c, body) => c.json(body);
+
+      app.get("/api/status", async (c) => json(c, await dashboardStatus(sdk, configNow())));
+      app.get("/api/handoff", async (c) => json(c, await dashboardHandoff(sdk, configNow())));
+      app.get("/api/memory", async (c) => {
+        const limit = Number(new URL(c.req.url).searchParams.get("limit"));
+        return json(c, await dashboardMemory(sdk, configNow(), { previewLimit: Number.isFinite(limit) && limit > 0 ? limit : 10 }));
+      });
+      app.get("/api/hooks", (c) => json(c, dashboardHooks()));
+    });
+    await sdk.logger.info("hana-powercontext registered dashboard routes");
+  } catch (error) {
+    // A composition without a route door simply has no card backend; the tools
+    // and hooks are unaffected, and saying so beats failing the load.
+    await sdk.logger.info(
+      `hana-powercontext: dashboard routes unavailable in this composition (${error && error.message ? error.message : String(error)})`,
+    );
+  }
+
   // One slash-command entry point with subcommands, rather than four separate
   // `/pc-*` words: the chat slash menu stays short, and `/pc` with no argument
   // is a usable help screen.
@@ -97,6 +128,11 @@ export default defineApp(async (sdk) => {
         return commandHooks(configNow(), probeCapabilities);
       case "handoff":
         return commandHandoff();
+      case "review":
+        // Human-only by construction: this is a slash command, so the only way to
+        // reach it is a person typing it. No pc_* tool exposes review, and none
+        // ever will — see lib/tools.js's review section.
+        return commandReview(sdk, configNow(), invocation.args);
       case "":
         return pcUsage();
       default:
@@ -108,7 +144,7 @@ export default defineApp(async (sdk) => {
     {
       name: "pc",
       description: "PowerContext: Server status, Scope, and memory inventory",
-      usage: "/pc [doctor|scope|memory|handoff]",
+      usage: "/pc [doctor|scope|memory|hooks|handoff|review]",
       handler: handlePc,
     },
     {
@@ -116,7 +152,7 @@ export default defineApp(async (sdk) => {
       // long slash menu.
       name: "powercontext",
       description: "Alias for /pc",
-      usage: "/powercontext [doctor|scope|memory|handoff]",
+      usage: "/powercontext [doctor|scope|memory|hooks|handoff|review]",
       handler: handlePc,
     },
   ];

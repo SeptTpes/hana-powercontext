@@ -14,13 +14,14 @@ import {
   commandHandoff,
   commandHooks,
   commandMemory,
+  commandReview,
   commandScope,
   HANDOFF_DISPOSITIONS,
   MEMORY_KINDS,
   pcUsage,
 } from "./tools.js";
 
-export { commandDoctor, commandHandoff, commandHooks, commandMemory, commandScope, pcUsage };
+export { commandDoctor, commandHandoff, commandHooks, commandMemory, commandReview, commandScope, pcUsage };
 
 const MAX_MEMORY_BYTES = 8192;
 

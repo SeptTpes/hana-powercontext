@@ -1,0 +1,122 @@
+/*
+ * ui/assets/dashboard.css — the dashboard card's presentation.
+ *
+ * Colours come from Hana's own theme variables where they exist (--bg, --text),
+ * with the App's warm palette as the fallback, so the card belongs to whichever
+ * theme the user runs rather than fighting it.
+ */
+
+:root {
+  --pc-bg: var(--bg, #f7f3eb);
+  --pc-card: var(--surface, #ffffff);
+  --pc-line: var(--border, #e2d9c9);
+  --pc-ink: var(--text, #3b342b);
+  --pc-muted: var(--text-secondary, #8d8371);
+  --pc-accent: #c8552b;
+  --pc-ok: #3f8f5f;
+  --pc-warn: #b8860b;
+  --pc-down: #b23b2e;
+}
+
+* { box-sizing: border-box; }
+
+html, body {
+  margin: 0;
+  min-height: 100%;
+  background: var(--pc-bg);
+  color: var(--pc-ink);
+  font: 13px/1.55 system-ui, -apple-system, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+}
+
+.pc-root { padding: 14px; display: flex; flex-direction: column; gap: 12px; }
+
+/* --- status strip ------------------------------------------------------- */
+
+.pc-status {
+  display: flex; align-items: flex-start; gap: 10px;
+  padding: 11px 13px; border-radius: 12px;
+  background: var(--pc-card); border: 1px solid var(--pc-line);
+  border-left-width: 4px;
+}
+.pc-status[data-tone="ok"] { border-left-color: var(--pc-ok); }
+.pc-status[data-tone="warn"] { border-left-color: var(--pc-warn); }
+.pc-status[data-tone="down"] { border-left-color: var(--pc-down); }
+.pc-status[data-tone="unknown"] { border-left-color: var(--pc-muted); }
+
+.pc-dot { width: 9px; height: 9px; border-radius: 50%; margin-top: 5px; flex: none; }
+.pc-status[data-tone="ok"] .pc-dot { background: var(--pc-ok); }
+.pc-status[data-tone="warn"] .pc-dot { background: var(--pc-warn); }
+.pc-status[data-tone="down"] .pc-dot { background: var(--pc-down); }
+.pc-status[data-tone="unknown"] .pc-dot { background: var(--pc-muted); }
+
+.pc-status-body { flex: 1; min-width: 0; }
+.pc-headline { font-weight: 600; font-size: 14px; }
+.pc-detail { color: var(--pc-muted); margin-top: 2px; }
+.pc-detail div { overflow-wrap: anywhere; }
+
+/* The "how to fix it" line. Never hidden, because it is the whole point of a
+   failure state. */
+.pc-fix {
+  margin-top: 7px; padding: 7px 9px; border-radius: 8px;
+  background: rgba(178, 59, 46, 0.07); color: var(--pc-down);
+  overflow-wrap: anywhere;
+}
+.pc-fix[data-tone="warn"] { background: rgba(184, 134, 11, 0.09); color: var(--pc-warn); }
+
+/* --- sections ----------------------------------------------------------- */
+
+.pc-section { background: var(--pc-card); border: 1px solid var(--pc-line); border-radius: 12px; overflow: hidden; }
+
+.pc-section-head {
+  display: flex; align-items: center; gap: 8px;
+  padding: 10px 13px; border-bottom: 1px solid var(--pc-line);
+  cursor: pointer; user-select: none;
+}
+.pc-section-head:hover { background: rgba(0, 0, 0, 0.015); }
+.pc-section-title { font-weight: 600; flex: 1; }
+.pc-chevron { color: var(--pc-muted); font-size: 11px; transition: transform 0.15s ease; }
+.pc-section[data-collapsed="true"] .pc-chevron { transform: rotate(-90deg); }
+.pc-section[data-collapsed="true"] .pc-section-body { display: none; }
+.pc-section-body { padding: 11px 13px; }
+
+.pc-line { margin: 0 0 4px; overflow-wrap: anywhere; }
+.pc-line:last-child { margin-bottom: 0; }
+.pc-muted { color: var(--pc-muted); }
+.pc-empty-action { margin-top: 7px; padding: 8px 10px; border-radius: 8px; background: rgba(200, 85, 43, 0.07); overflow-wrap: anywhere; }
+
+.pc-counts { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 9px; }
+.pc-count {
+  display: inline-flex; align-items: center; gap: 5px;
+  padding: 2px 8px; border-radius: 999px; background: rgba(0, 0, 0, 0.04); font-size: 12px;
+}
+
+.pc-entry { display: flex; gap: 8px; padding: 6px 0; border-top: 1px solid var(--pc-line); }
+.pc-entry:first-of-type { border-top: 0; }
+.pc-badge {
+  flex: none; align-self: flex-start; margin-top: 1px;
+  padding: 1px 7px; border-radius: 999px; font-size: 11px;
+  background: rgba(200, 85, 43, 0.1); color: var(--pc-accent);
+}
+.pc-entry[data-retired="true"] { opacity: 0.55; }
+.pc-entry-text { flex: 1; min-width: 0; overflow-wrap: anywhere; }
+.pc-entry-id { color: var(--pc-muted); font-size: 11px; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+
+/* --- footer ------------------------------------------------------------- */
+
+.pc-footer {
+  display: flex; align-items: center; gap: 10px;
+  padding: 9px 13px; border-radius: 12px;
+  background: var(--pc-card); border: 1px solid var(--pc-line);
+  color: var(--pc-muted); font-size: 12px;
+}
+.pc-footer-lines { flex: 1; min-width: 0; }
+.pc-footer-lines div { overflow-wrap: anywhere; }
+
+button.pc-refresh {
+  flex: none; padding: 6px 12px; border-radius: 8px; cursor: pointer;
+  border: 1px solid var(--pc-line); background: var(--pc-bg); color: var(--pc-ink); font: inherit;
+}
+button.pc-refresh:hover { border-color: var(--pc-accent); color: var(--pc-accent); }
+button.pc-refresh:disabled { opacity: 0.5; cursor: default; }
+
+.pc-timestamp { margin-top: 2px; }

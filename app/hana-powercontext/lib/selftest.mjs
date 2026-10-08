@@ -15,8 +15,19 @@
 
 import { resolveConfig, envNameFor, DEFAULTS } from "./config.js";
 import { request, probe } from "./powercontext.js";
-import { callRemember, callMemoryList, callHandoffPrepare, resolveScope, commandDoctor, commandHooks } from "./tools.js";
+import {
+  callRemember,
+  callMemoryList,
+  callHandoffPrepare,
+  resolveScope,
+  commandDoctor,
+  commandHooks,
+  commandReview,
+  reviewCandidates,
+  decideCandidate,
+} from "./tools.js";
 import { buildToolRegistrations } from "./register.js";
+import { dashboardStatus, dashboardHandoff, dashboardMemory, dashboardHooks } from "./dashboard.js";
 import {
   messageText,
   lastUserIndex,
@@ -66,7 +77,18 @@ function stubSdk(behaviour, { dataDir = null } = {}) {
     dataDir,
     network: {
       async fetch(url, init) {
-        calls.push({ url, init });
+        // `body` is the parsed request body alongside the raw `init`, so an
+        // assertion can read what was sent without re-parsing. Purely additive:
+        // existing checks read `init`.
+        let body;
+        if (init && typeof init.body === "string") {
+          try {
+            body = JSON.parse(init.body);
+          } catch {
+            body = undefined;
+          }
+        }
+        calls.push({ url, init, body });
         return behaviour(url, init, calls.length);
       },
     },
@@ -722,6 +744,251 @@ section("stage 2 counters and /pc hooks");
   // Counters must survive a cache clear, so /pc hooks cannot be reset by traffic.
   clearRecallCache();
   check("clearing the cache does not reset counters", counters.prestep_invocations === 0 && recallCacheSize() === 0);
+}
+
+/* ------------------------------------------- stage 3: dashboard backend -- */
+
+section("stage 3 dashboard backend");
+{
+  const cardBehaviour = (url) => {
+    if (url.endsWith("/health/live")) return jsonResponse(200, { status: "ok" });
+    if (url.endsWith("/health/ready")) return jsonResponse(200, { status: "ready", checks: { runtime: "ready", database: "ready" } });
+    if (url.endsWith("/v1/capabilities")) return jsonResponse(200, { handoff_generation: false, search_modes: ["auto"] });
+    if (url.endsWith("/v1/scopes/default")) return jsonResponse(200, { scope_id: "scp_card", title: "Default", summary: "Default context" });
+    if (url.endsWith("/v1/handoff/continue")) return jsonResponse(200, { trust: "untrusted_history", status: "empty", content: null });
+    if (url.endsWith("/v1/memory/entries/list")) {
+      return jsonResponse(200, {
+        memory: { family: "memory", artifact_id: "memory", revision: 2 },
+        entries: [
+          { citation: { entry_id: "mem_ent_a" }, kind: "project-fact", text: "first", state: "active" },
+          { citation: { entry_id: "mem_ent_b" }, kind: "decision", text: "second", state: "retired" },
+        ],
+      });
+    }
+    return jsonResponse(404, { error: { code: "unknown", message: "no stub for " + url, details: null } });
+  };
+
+  const { sdk, calls } = stubSdk(cardBehaviour);
+  const config = resolveConfig(sdk, { scopeId: "scp_card" });
+
+  const status = await dashboardStatus(sdk, config);
+  check("dashboard status reports the Server up", status.ok === true && status.server.status === "ready", status.ok);
+  check("dashboard status carries the Scope", status.scope.ok === true && status.scope.scopeId === "scp_card", status.scope);
+  check("dashboard status carries the switches", status.config.prestep === true, status.config);
+
+  const handoff = await dashboardHandoff(sdk, config);
+  check("an empty handoff is ok:true with handoff:null", handoff.ok === true && handoff.handoff === null, handoff);
+
+  const memory = await dashboardMemory(sdk, config);
+  check("dashboard memory counts by kind", memory.total === 2 && memory.byKind["project-fact"] === 1, memory.byKind);
+  check("dashboard memory previews entries", memory.entries.length === 2, memory.entries.length);
+
+  const hooks = dashboardHooks();
+  check("dashboard hooks mirrors counters read-only", hooks.ok === true && typeof hooks.counters.prestep_invocations === "number");
+
+  // The card must never write. This is the assertion that keeps a future edit
+  // from quietly turning a status surface into a mutating one.
+  const MUTATING = /remember|sources\/content|entries\/revise|entries\/retire|handoff\/prepare|handoff\/finalize|artifact-candidates\/(approve|reject)/;
+  check("no dashboard call touched a mutating endpoint", !calls.some((c) => MUTATING.test(c.url)), calls.map((c) => c.url));
+}
+
+section("stage 3 dashboard backend degrades, never 500s");
+{
+  const { sdk } = stubSdk(() => {
+    throw new TypeError("fetch failed: connect ECONNREFUSED 127.0.0.1:8000");
+  });
+  const config = resolveConfig(sdk, {});
+
+  let threw = null;
+  let status;
+  let handoff;
+  let memory;
+  try {
+    status = await dashboardStatus(sdk, config);
+    handoff = await dashboardHandoff(sdk, config);
+    memory = await dashboardMemory(sdk, config);
+  } catch (error) {
+    threw = error;
+  }
+  check("no dashboard section throws when the Server is down", threw === null, threw && threw.message);
+  check("status degrades to ok:false (the route can still answer 200)", status.ok === false, status.ok);
+  check("status keeps the hint the card renders as 怎么修", typeof status.server.error.hint === "string" && status.server.error.hint.length > 0, status.server.error);
+  check("handoff degrades to ok:false", handoff.ok === false);
+  check("memory degrades to ok:false with no entries", memory.ok === false && memory.entries.length === 0);
+}
+
+section("stage 3 D21: the alert only fires on a real decision");
+{
+  const sdk = stubSdk(() => jsonResponse(200, {})).sdk;
+  const config = resolveConfig(sdk, {});
+
+  // not_asked is the ledger having no record, which is the clean-install state.
+  const notAsked = await commandHooks(config, async () => ({
+    capabilities: [
+      { capability: "app/hooks.agent-pre-step", status: "always", enforcement: "advisory" },
+      { capability: "app/hooks.tools-pre-execute", status: "not_asked", enforcement: "advisory" },
+      { capability: "app/hooks.session-input", status: "not_asked", enforcement: "advisory" },
+    ],
+  }));
+  check("D21: not_asked no longer raises the warning", !/WARNING: unexpected hook grants/.test(notAsked), notAsked);
+  // The ledger area shows this App's own two words. An out-of-plan *undecided*
+  // word is neither a grant nor a plan entry, so it belongs in neither the
+  // warning nor the plan list — silence here is the fix, not an omission.
+  check("D21: an out-of-plan not_asked word is not listed as a plan entry", !notAsked.includes("app/hooks.tools-pre-execute"), notAsked);
+  check("D21: the App's own word is still reported as not_asked", /app\/hooks\.agent-before-start\s+not_asked/.test(notAsked), notAsked);
+
+  // A real grant outside the plan is exactly what the warning is for.
+  const granted = await commandHooks(config, async () => ({
+    capabilities: [
+      { capability: "app/hooks.agent-pre-step", status: "always", enforcement: "advisory" },
+      { capability: "app/hooks.tools-pre-execute", status: "always", enforcement: "advisory" },
+    ],
+  }));
+  check("D21: a real out-of-plan grant still warns", /WARNING: unexpected hook grants present: app\/hooks\.tools-pre-execute/.test(granted), granted);
+
+  const denied = await commandHooks(config, async () => ({
+    capabilities: [{ capability: "app/hooks.tools-post-execute", status: "denied", enforcement: "advisory" }],
+  }));
+  check("D21: a denial is a decision, so it warns", /WARNING: unexpected hook grants/.test(denied), denied);
+
+  const sessionTier = await commandHooks(config, async () => ({
+    capabilities: [{ capability: "app/hooks.session-input", status: "session", enforcement: "advisory" }],
+  }));
+  check("D21: a session-tier grant warns", /WARNING: unexpected hook grants/.test(sessionTier), sessionTier);
+
+  const clean = await commandHooks(config, async () => ({ capabilities: [] }));
+  check("D21: an empty ledger is silent", !/WARNING/.test(clean), clean);
+}
+
+/* ---------------------------------------------------- stage 3: /pc review -- */
+
+section("stage 3 /pc review: human gate");
+{
+  const scopeStub = (url) => {
+    if (url.endsWith("/v1/scopes/default")) return jsonResponse(200, { scope_id: "scp_review", title: "Default", summary: "d" });
+    return null;
+  };
+
+  const listing = stubSdk((url) => {
+    const base = scopeStub(url);
+    if (base) return base;
+    if (url.endsWith("/v1/artifact-candidates/list")) {
+      return jsonResponse(200, {
+        candidates: [
+          { candidate_id: "cand_1", version: 3, family: "experience", status: "pending", source_refs: [{}, {}], proposal: { lesson: "always read the error code" } },
+          { candidate_id: "cand_2", version: 1, family: "skill", status: "pending", source_refs: [], proposal: { name: "nightly-check" } },
+        ],
+        next_cursor: null,
+      });
+    }
+    return jsonResponse(404, { error: { code: "unknown", message: "no stub", details: null } });
+  });
+  const listText = await commandReview(listing.sdk, resolveConfig(listing.sdk, { scopeId: "scp_review" }), "");
+  check("review lists the candidates", listText.includes("cand_1") && listText.includes("cand_2"), listText);
+  check("review shows family and version", /cand_1\s+\[experience\] v3/.test(listText), listText);
+  check("review shows a gist of the proposal", listText.includes("always read the error code"), listText);
+  check("review shows the evidence count", /证据 2 条/.test(listText), listText);
+  check("review tells the human the two decisions", listText.includes("/pc review approve <id>") && listText.includes("/pc review reject <id>"), listText);
+  check("review states that decisions belong to the human", /审阅决定只属于人/.test(listText), listText);
+
+  const emptyQueue = stubSdk((url) => scopeStub(url) || jsonResponse(200, { candidates: [], next_cursor: null }));
+  const emptyText = await commandReview(emptyQueue.sdk, resolveConfig(emptyQueue.sdk, { scopeId: "scp_review" }), "list");
+  check("an empty queue says it is normal, not an error", /没有待审阅的候选/.test(emptyText) && /不是错误/.test(emptyText), emptyText);
+  check("an empty queue explains why it can be empty", /生成能力/.test(emptyText), emptyText);
+  check("an empty queue does not report a failure", !/失败/.test(emptyText), emptyText);
+
+  const approve = stubSdk((url) => {
+    const base = scopeStub(url);
+    if (base) return base;
+    if (url.endsWith("/v1/artifact-candidates/get")) return jsonResponse(200, { candidate_id: "cand_1", version: 4, family: "experience", status: "pending" });
+    if (url.endsWith("/v1/artifact-candidates/approve")) return jsonResponse(200, { candidate_id: "cand_1", version: 5, status: "approved" });
+    return jsonResponse(404, { error: { code: "unknown", message: "no stub", details: null } });
+  });
+  const approveText = await commandReview(approve.sdk, resolveConfig(approve.sdk, { scopeId: "scp_review" }), "approve cand_1");
+  check("approve reports success with the version it read", /已批准 cand_1（v4/.test(approveText), approveText);
+  const approveCall = approve.calls.find((c) => c.url.endsWith("/approve"));
+  check("approve used the version it read, not a guess", approveCall.body.expected_version === 4, approveCall.body);
+  check("approve sent the resolved scope", approveCall.body.scope_id === "scp_review", approveCall.body);
+  check("approve never sent a reason", approveCall.body.reason === undefined, approveCall.body);
+
+  const reject = stubSdk((url) => {
+    const base = scopeStub(url);
+    if (base) return base;
+    if (url.endsWith("/v1/artifact-candidates/get")) return jsonResponse(200, { candidate_id: "cand_2", version: 2, status: "pending" });
+    if (url.endsWith("/v1/artifact-candidates/reject")) return jsonResponse(200, { candidate_id: "cand_2", version: 3, status: "rejected" });
+    return jsonResponse(404, { error: { code: "unknown", message: "no stub", details: null } });
+  });
+  const rejectText = await commandReview(reject.sdk, resolveConfig(reject.sdk, { scopeId: "scp_review" }), "reject cand_2 证据不足，先补一条来源");
+  check("reject reports the rejection", /已驳回 cand_2/.test(rejectText), rejectText);
+  check("reject echoes the human's reason", rejectText.includes("证据不足，先补一条来源"), rejectText);
+  const rejectCall = reject.calls.find((c) => c.url.endsWith("/reject"));
+  check("reject sent the reason", rejectCall.body.reason === "证据不足，先补一条来源", rejectCall.body);
+  check("reject used the version it read", rejectCall.body.expected_version === 2, rejectCall.body);
+
+  const noId = stubSdk((url) => scopeStub(url) || jsonResponse(200, {}));
+  const noIdText = await commandReview(noId.sdk, resolveConfig(noId.sdk, { scopeId: "scp_review" }), "approve");
+  check("approve without an id asks for one", /用法/.test(noIdText), noIdText);
+  check("approve without an id makes no Server call", noId.calls.length === 0, noId.calls.map((c) => c.url));
+
+  const unknown = await commandReview(noId.sdk, resolveConfig(noId.sdk, { scopeId: "scp_review" }), "frobnicate");
+  check("an unknown review subcommand prints help", /未知的 review 子命令/.test(unknown) && unknown.includes("/pc review approve"), unknown);
+
+  const conflict = stubSdk((url) => {
+    const base = scopeStub(url);
+    if (base) return base;
+    if (url.endsWith("/v1/artifact-candidates/get")) return jsonResponse(200, { candidate_id: "cand_3", version: 1, status: "pending" });
+    if (url.endsWith("/v1/artifact-candidates/approve")) {
+      return jsonResponse(409, { error: { code: "version_conflict", message: "The Candidate changed.", details: null } });
+    }
+    return jsonResponse(404, { error: { code: "unknown", message: "no stub", details: null } });
+  });
+  const conflictText = await commandReview(conflict.sdk, resolveConfig(conflict.sdk, { scopeId: "scp_review" }), "approve cand_3");
+  check("a version conflict is reported", /失败/.test(conflictText), conflictText);
+  check("a version conflict tells the human to look again", /重新跑 \/pc review 看最新版本/.test(conflictText), conflictText);
+  check("a version conflict states that nothing was retried", /没有做任何自动重试/.test(conflictText), conflictText);
+  check(
+    "a conflict made exactly two calls (get, then the failed decision)",
+    conflict.calls.filter((c) => !c.url.endsWith("/v1/scopes/default")).length === 2,
+    conflict.calls.map((c) => c.url),
+  );
+
+  const noVersion = stubSdk((url) => {
+    const base = scopeStub(url);
+    if (base) return base;
+    if (url.endsWith("/v1/artifact-candidates/get")) return jsonResponse(200, { candidate_id: "cand_4", status: "pending" });
+    return jsonResponse(404, { error: { code: "unknown", message: "no stub", details: null } });
+  });
+  const blindText = await commandReview(noVersion.sdk, resolveConfig(noVersion.sdk, { scopeId: "scp_review" }), "approve cand_4");
+  check("a missing version refuses to decide blind", /refusing to decide blind/.test(blindText), blindText);
+  check("no decision call was made without a version", !noVersion.calls.some((c) => c.url.endsWith("/approve")), noVersion.calls.map((c) => c.url));
+
+  const structured = await reviewCandidates(listing.sdk, resolveConfig(listing.sdk, { scopeId: "scp_review" }), {});
+  check("reviewCandidates returns structured data", structured.ok === true && Array.isArray(structured.candidates), structured);
+  check("reviewCandidates reports the candidate version for the gate", structured.candidates[0].version === 3, structured.candidates[0]);
+
+  const decide = await decideCandidate(approve.sdk, resolveConfig(approve.sdk, { scopeId: "scp_review" }), { candidateId: "cand_1", decision: "approve" });
+  check("decideCandidate returns structured data", decide.ok === true && decide.version === 4, decide);
+}
+
+section("stage 3 red line: review stays out of the model tool surface");
+{
+  const regs = buildToolRegistrations();
+  const names = regs.map((r) => r.name);
+
+  check("the tool set is still exactly the three pc_ tools", regs.length === 3, names);
+  check("no tool name mentions review", !names.some((n) => /review|approve|reject|candidate/i.test(n)), names);
+  check(
+    "no tool description offers a review action",
+    !regs.some((r) => /approve|reject|批准|驳回/i.test(r.description)),
+    regs.map((r) => r.name),
+  );
+  check(
+    "no tool parameters expose a candidate id",
+    !regs.some((r) => JSON.stringify(r.parameters).includes("candidate")),
+    regs.map((r) => r.name),
+  );
+  check("reviewCandidates is a function, not a registration", typeof reviewCandidates === "function");
+  check("commandReview is a command handler, not a registered tool", typeof commandReview === "function" && !names.includes("commandReview"));
 }
 
 /* ------------------------------------------------- registration surface -- */

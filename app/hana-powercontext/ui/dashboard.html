@@ -1,0 +1,25 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>PowerContext 看板</title>
+  <link rel="stylesheet" href="./assets/dashboard.css">
+</head>
+<body>
+  <main class="pc-root" id="root" aria-busy="true">
+    <!-- Rendered entirely by ./assets/dashboard.js. Nothing Server-provided is
+         ever inserted as HTML; the script builds text nodes. -->
+    <div class="pc-status" data-tone="unknown">
+      <span class="pc-dot"></span>
+      <div class="pc-status-body">
+        <div class="pc-headline" id="boot-headline">正在连接…</div>
+        <div class="pc-detail"><div>正在从 App 后端读取状态。</div></div>
+      </div>
+    </div>
+  </main>
+
+  <script src="./assets/dashboard.js"></script>
+  <script src="./assets/dashboard-page.js"></script>
+</body>
+</html>

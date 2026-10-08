@@ -423,6 +423,197 @@ export async function callHandoffPrepare(sdk, config, args = {}) {
   );
 }
 
+/* ----------------------------------------------------------------- review -- */
+
+/**
+ * /pc review — the human gate for review-class changes.
+ *
+ * RED LINE, stated here because this is where it would be broken: **no review or
+ * administration operation is ever exposed as a model-facing tool.** The pc_* tool
+ * set contains none, and this module deliberately adds none. The only way to reach
+ * the functions below is a slash command, and a slash command is text a person
+ * types — the model cannot manufacture one, cannot call one through tool-calling,
+ * and cannot ask this App to run one on its behalf.
+ *
+ * That matters because approving an Artifact Candidate publishes a generated
+ * artifact into the Scope. A model that could approve its own proposals would be
+ * reviewing its own work, which is exactly the property the human gate exists to
+ * prevent. The design rule is not "the model probably will not"; it is "the model
+ * has no path to it".
+ *
+ * These functions never auto-retry. A version conflict is answered with what the
+ * Server said and an instruction to refresh and decide again — an automatic retry
+ * would silently apply a decision to a revision the human never looked at.
+ */
+
+/** List pending Artifact Candidates for the effective Scope. */
+export async function reviewCandidates(sdk, config, { status = "pending", limit = 50 } = {}) {
+  const scope = await resolveScope(sdk, config, undefined);
+  if (!scope.ok) return { ok: false, error: scope };
+
+  const response = await request(sdk, config, "/v1/artifact-candidates/list", {
+    scope_id: scope.scopeId,
+    status,
+    limit,
+  });
+  if (!response.ok) return { ok: false, error: response, scope: scope.scopeId };
+
+  const candidates = (response.data && response.data.candidates) || [];
+  return {
+    ok: true,
+    scopeId: scope.scopeId,
+    candidates: candidates.map((candidate) => ({
+      candidateId: candidate.candidate_id,
+      version: candidate.version,
+      family: candidate.family,
+      status: candidate.status,
+      sourceCount: Array.isArray(candidate.source_refs) ? candidate.source_refs.length : 0,
+      /** A one-line gist, so a human can tell proposals apart without opening each. */
+      summary: candidateSummary(candidate),
+    })),
+    nextCursor: response.data ? response.data.next_cursor : null,
+  };
+}
+
+/** Best-effort one-liner for a Candidate's proposal, which varies by family. */
+function candidateSummary(candidate) {
+  const proposal = candidate && candidate.proposal ? candidate.proposal : null;
+  if (!proposal || typeof proposal !== "object") return "";
+  const fields = ["name", "title", "lesson", "summary", "objective", "description"];
+  for (const field of fields) {
+    if (typeof proposal[field] === "string" && proposal[field].trim() !== "") {
+      const value = proposal[field].trim();
+      return value.length > 120 ? value.slice(0, 120) + "…" : value;
+    }
+  }
+  return "";
+}
+
+/**
+ * Approve or reject one Candidate.
+ *
+ * `expectedVersion` is the optimistic-concurrency token the Server requires. When
+ * the human did not supply one, it is read from the Server and passed straight
+ * through — which is safe precisely because the read and the decision happen in
+ * one command the human just typed, and because a mismatch is surfaced rather than
+ * retried.
+ */
+export async function decideCandidate(sdk, config, { candidateId, decision, expectedVersion, reason } = {}) {
+  const scope = await resolveScope(sdk, config, undefined);
+  if (!scope.ok) return { ok: false, error: scope };
+
+  let version = Number.isFinite(expectedVersion) && expectedVersion >= 1 ? expectedVersion : null;
+  if (version === null) {
+    const fetched = await request(sdk, config, "/v1/artifact-candidates/get", {
+      scope_id: scope.scopeId,
+      candidate_id: candidateId,
+    });
+    if (!fetched.ok) return { ok: false, error: fetched, scope: scope.scopeId };
+    version = fetched.data ? fetched.data.version : null;
+    if (!Number.isFinite(version)) {
+      return {
+        ok: false,
+        scope: scope.scopeId,
+        error: {
+          kind: "no_version",
+          message: `Candidate ${candidateId} returned no version; refusing to decide blind.`,
+          hint: "The Server must report the Candidate's current version before it can be decided.",
+        },
+      };
+    }
+  }
+
+  const body = { scope_id: scope.scopeId, candidate_id: candidateId, expected_version: version };
+  const path = decision === "reject" ? "/v1/artifact-candidates/reject" : "/v1/artifact-candidates/approve";
+  if (decision === "reject") {
+    body.reason = reason && reason.trim() !== "" ? reason.trim() : "Rejected from Hana.";
+  }
+
+  const response = await request(sdk, config, path, body);
+  if (!response.ok) return { ok: false, error: response, scope: scope.scopeId, version };
+  return { ok: true, scopeId: scope.scopeId, version, candidate: response.data || null };
+}
+
+/** Render `/pc review` and its subcommands for a person reading chat. */
+export async function commandReview(sdk, config, argsText) {
+  const tokens = String(argsText || "").trim().split(/\s+/).filter(Boolean);
+  const action = (tokens[0] || "").toLowerCase();
+
+  if (action === "" || action === "list") {
+    const result = await reviewCandidates(sdk, config, {});
+    if (!result.ok) {
+      const error = result.error || {};
+      return [
+        "取审阅队列失败。",
+        error.message || "未知错误。",
+        error.hint ? `怎么修：${error.hint}` : "先确认 /pc doctor 通过。",
+      ].join("\n");
+    }
+    if (result.candidates.length === 0) {
+      return [
+        `Scope ${result.scopeId} 没有待审阅的候选 —— 这是正常的，不是错误。`,
+        "",
+        "候选由 Server 的生成能力产出（Experience / Skill 等）。当前 Server 若未配置生成凭据，",
+        "队列就会一直是空的；/pc doctor 可以看到 handoff_generation 等能力状态。",
+        "",
+        "审阅决定只属于人：approve / reject 只能由你在聊天里敲出来，模型没有对应工具。",
+      ].join("\n");
+    }
+
+    const lines = [`Scope ${result.scopeId} 有 ${result.candidates.length} 个待审阅候选：`, ""];
+    for (const candidate of result.candidates) {
+      lines.push(`· ${candidate.candidateId}  [${candidate.family}] v${candidate.version}`);
+      if (candidate.summary) lines.push(`    ${candidate.summary}`);
+      if (candidate.sourceCount) lines.push(`    证据 ${candidate.sourceCount} 条`);
+    }
+    lines.push("", "决定：/pc review approve <id>　/pc review reject <id> [理由]");
+    lines.push("审阅决定只属于人：模型工具面没有对应工具，且永远不会有。");
+    return lines.join("\n");
+  }
+
+  if (action === "approve" || action === "reject") {
+    const candidateId = tokens[1];
+    if (!candidateId) {
+      return `用法：/pc review ${action} <候选 id>${action === "reject" ? " [理由]" : ""}\n` +
+        "先用 /pc review 看有哪些候选。";
+    }
+    const reason = action === "reject" ? tokens.slice(2).join(" ") : undefined;
+
+    const result = await decideCandidate(sdk, config, { candidateId, decision: action, reason });
+    if (!result.ok) {
+      const error = result.error || {};
+      const lines = [`${action === "reject" ? "驳回" : "批准"} ${candidateId} 失败。`, error.message || "未知错误。"];
+      if (error.serverCode === "candidate_not_found") {
+        lines.push("这个 id 在当前 Scope 里不存在 —— 重新跑 /pc review 看最新列表。");
+      } else if (error.status === 409) {
+        // Optimistic-concurrency conflict: the human must look again. Never retry.
+        lines.push("候选在你看过之后被改过（版本冲突）。重新跑 /pc review 看最新版本，再决定一次。");
+      }
+      if (error.hint) lines.push(`怎么修：${error.hint}`);
+      lines.push("没有做任何自动重试 —— 决定必须落在你看过的那一版上。");
+      return lines.join("\n");
+    }
+
+    return [
+      `${action === "reject" ? "已驳回" : "已批准"} ${candidateId}（v${result.version}，Scope ${result.scopeId}）。`,
+      action === "reject" && reason ? `理由：${reason}` : null,
+      action === "approve" ? "该候选已按 Server 的发布语义生效。" : "该候选不会生效。",
+    ]
+      .filter((line) => line !== null)
+      .join("\n");
+  }
+
+  return [
+    `未知的 review 子命令「${action}」。`,
+    "",
+    "  /pc review                      列出待审阅候选",
+    "  /pc review approve <id>         批准一个候选",
+    "  /pc review reject <id> [理由]   驳回一个候选",
+    "",
+    "审阅决定只属于人：approve / reject 只能由你在聊天里敲出来，模型没有对应工具。",
+  ].join("\n");
+}
+
 /* --------------------------------------------------------------- commands -- */
 
 function plural(count, singular) {
@@ -575,8 +766,15 @@ export async function commandHooks(config, probeCapabilities) {
         // the turn proceeds — which is why "not_asked" is not an error here.
         lines.push(`  ${capability.padEnd(30)} ${status}${enforcement}`);
       }
+      // D21 fix: only a real decision is worth warning about. `not_asked` is the
+      // ledger having no record — a posture, not a grant — and warning on it made
+      // /pc hooks report "unexpected hook grants present" on a clean install whose
+      // ledger held zero hook records. The alert must mean what it says, or it
+      // trains the reader to ignore it.
+      const DECIDED_STATUSES = new Set(["always", "allowed", "session", "denied"]);
       const unexpected = rows
         .filter((item) => item && typeof item.capability === "string" && item.capability.startsWith("app/hooks."))
+        .filter((item) => DECIDED_STATUSES.has(item.status))
         .map((item) => item.capability)
         .filter((name) => !wanted.includes(name));
       if (unexpected.length > 0) {
@@ -617,7 +815,9 @@ export function pcUsage() {
     "  /pc memory    memory inventory for the effective Scope",
     "  /pc hooks     recall/capture counters and hook grant status",
     "  /pc handoff   how to drive a work handoff",
+    "  /pc review    审阅队列；approve / reject 只有人能执行",
     "",
-    "Nothing here writes to the Server.",
+    "除 /pc review approve|reject 外，这里都只读或只做一次显式写入；",
+    "审阅决定只属于人 —— 模型工具面没有对应工具。",
   ].join("\n");
 }

@@ -2,7 +2,7 @@
   "manifestVersion": 2,
   "id": "hana-powercontext",
   "name": "PowerContext",
-  "version": "0.2.2",
+  "version": "0.3.0",
   "description": "Bounded recall and durable handoff for this session, backed by a running PowerContext Server.",
   "entry": "index.js",
   "capabilities": [
@@ -23,5 +23,18 @@
     ],
     "defaultTimeoutMs": 5000,
     "maxResponseBytes": 131072
+  },
+  "contributes": {
+    "cards": [
+      {
+        "id": "dashboard",
+        "title": "PowerContext 看板",
+        "description": "当前 Scope、最新 Handoff 状态、记忆清单与 Server 连通状态。",
+        "route": "/dashboard.html",
+        "face": {
+          "image": "assets/dashboard-cover.svg"
+        }
+      }
+    ]
   }
 }
