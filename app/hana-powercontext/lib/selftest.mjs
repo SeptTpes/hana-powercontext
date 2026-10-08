@@ -28,7 +28,16 @@ import {
   decideCandidate,
 } from "./tools.js";
 import { buildToolRegistrations } from "./register.js";
-import { dashboardStatus, dashboardHandoff, dashboardMemory, dashboardHooks } from "./dashboard.js";
+import { dashboardStatus, dashboardHandoff, dashboardMemory, dashboardHooks, isNetworkFailure, sectionMeta } from "./dashboard.js";
+
+// The card's view logic is a browser file (UMD-ish: it publishes a global and a
+// CommonJS export), so it is loaded through createRequire rather than imported.
+const requireUi = createRequire(import.meta.url);
+const dashboardView = requireUi("../ui/assets/dashboard.js");
+/** The card's transport layer: door selection, failure classes, view state. */
+const transport = requireUi("../ui/assets/dashboard-fetch.js");
+/** Shorthand: the view's status renderer, used by the Fix-4 branch assertions. */
+const describeStatusForTest = (status) => dashboardView.describeStatus(status);
 import {
   messageText,
   lastUserIndex,
@@ -1016,8 +1025,11 @@ section("BUG-3: the card has exactly one door, and it carries credentials");
   //     `src` attributes, not a bare indexOf: the file names also appear in the
   //     comments above the tags, which would make the comparison meaningless.
   const srcOrder = [...html.matchAll(/<script\b[^>]*\bsrc=["']([^"']+)["'][^>]*>/g)].map((match) => match[1]);
-  const fetchAt = srcOrder.findIndex((src) => src.endsWith("dashboard-fetch.js"));
-  const pageAt = srcOrder.findIndex((src) => src.endsWith("dashboard-page.js"));
+  // Compare pathnames, not raw URLs: every self-reference now carries a ?v= cache
+  // key (Fix-1), so a bare endsWith() would never match the stamped name.
+  const pathnameOf = (src) => String(src).split("?")[0].split("#")[0];
+  const fetchAt = srcOrder.findIndex((src) => pathnameOf(src).endsWith("dashboard-fetch.js"));
+  const pageAt = srcOrder.findIndex((src) => pathnameOf(src).endsWith("dashboard-page.js"));
   check("the card page loads the transport", fetchAt > -1, srcOrder);
   check("the transport loads before the wiring that uses it", fetchAt > -1 && pageAt > -1 && fetchAt < pageAt, srcOrder);
 
@@ -1037,7 +1049,7 @@ section("BUG-3: the card has exactly one door, and it carries credentials");
 
   // (5) Version, and the manifest is otherwise untouched by this fix.
   const manifest = JSON.parse(readAppFile("manifest.json"));
-  check("the version is 0.3.3", manifest.version === "0.3.3", manifest.version);
+  check("the version is 0.3.4", manifest.version === "0.3.4", manifest.version);
   check("the capabilities are unchanged by the fix", JSON.stringify(manifest.capabilities) === JSON.stringify(["app/tools.expose-to-model", "app/hooks.agent-pre-step", "app/hooks.agent-before-start"]), manifest.capabilities);
   check("the card contribution is unchanged by the fix", manifest.contributes.cards.length === 1 && manifest.contributes.cards[0].route === "/dashboard.html", manifest.contributes);
 
@@ -1058,13 +1070,15 @@ section("BUG-3: the card has exactly one door, and it carries credentials");
 
   // The page must pull the bridge in as a module. A classic <script src> would be a
   // syntax error, and no import at all means no hana — the original defect.
-  check("the card page imports the bridge as a module", /import\s*\{[^}]*\bhana\b[^}]*\}\s*from\s*["']\.\/sdk\.js["']/.test(page), page.slice(0, 200));
-  check("the card page is loaded as type=module", /<script[^>]*type=["']module["'][^>]*src=["'][^"']*dashboard-page\.js["']/.test(html), html.slice(-500));
+  // The ?v= query (Fix-1) is part of the specifier now, so it is matched but not
+  // required here; the staleness of that query is asserted separately below.
+  check("the card page imports the bridge as a module", /import\s*\{[^}]*\bhana\b[^}]*\}\s*from\s*["']\.\/sdk\.js(\?v=[^"']*)?["']/.test(page), page.slice(0, 200));
+  check("the card page is loaded as type=module", /<script[^>]*type=["']module["'][^>]*src=["'][^"']*dashboard-page\.js(\?v=[^"']*)?["']/.test(html), html.slice(-500));
   check("the page does not classic-load the bridge (that would be a syntax error)", !/<script(?![^>]*type=["']module["'])[^>]*src=["'][^"']*sdk\.js["']/.test(html));
   // Order must be read from the actual `src` attributes: a naive indexOf also
   // matches the file names as they appear in the explanatory comments above them.
   const scriptSrcs = [...html.matchAll(/<script\b[^>]*\bsrc=["']([^"']+)["'][^>]*>/g)].map((match) => match[1]);
-  const indexOfSrc = (name) => scriptSrcs.findIndex((src) => src.endsWith(name));
+  const indexOfSrc = (name) => scriptSrcs.findIndex((src) => String(src).split("?")[0].split("#")[0].endsWith(name));
   check("the view logic is loaded before its wiring", indexOfSrc("dashboard.js") > -1 && indexOfSrc("dashboard.js") < indexOfSrc("dashboard-page.js"), scriptSrcs);
   check("the transport is loaded before its wiring", indexOfSrc("dashboard-fetch.js") > -1 && indexOfSrc("dashboard-fetch.js") < indexOfSrc("dashboard-page.js"), scriptSrcs);
   check("the bridge is never loaded as a classic script tag", indexOfSrc("sdk.js") === -1, scriptSrcs);
@@ -1094,6 +1108,199 @@ section("BUG-3: the card has exactly one door, and it carries credentials");
   check("the imported bridge is handed to the transport", /hana,/.test(pageCode) && /loadSection\(/.test(pageCode), "expected options.hana: hana");
   check("the state bridge uses the imported binding, not a global", /if \(hana && hana\.state/.test(pageCode), pageCode.slice(0, 200));
   check("the page never assigns a global hana", !/globalThis\.hana\s*=/.test(pageCode));
+}
+
+/* ------------------------------- TASK-8 Fix-1: cache-busting the ui tree -- */
+
+section("Fix-1: every self-referencing asset is version-stamped");
+{
+  const requireFromHere = createRequire(import.meta.url);
+  const fs = requireFromHere("node:fs");
+  const path = requireFromHere("node:path");
+  const appDir = path.join(path.dirname(new URL(import.meta.url).pathname), "..");
+  const htmlText = fs.readFileSync(path.join(appDir, "ui/dashboard.html"), "utf8");
+  const pageText = fs.readFileSync(path.join(appDir, "ui/assets/dashboard-page.js"), "utf8");
+  const manifestText = JSON.parse(fs.readFileSync(path.join(appDir, "manifest.json"), "utf8"));
+  const version = manifestText.version;
+
+  // Every asset the page pulls from its own tree. These are the URLs a host cache
+  // would otherwise pin to a previous build — the mechanism that let a fixed card
+  // keep showing an old failure through several real fixes.
+  const ATTRIBUTE_REFS = [...htmlText.matchAll(/(?:href|src)=["'](\.\/[^"']+)["']/g)].map((m) => m[1]);
+  const IMPORT_REFS = [...pageText.matchAll(/from\s*["'](\.\/[^"']+)["']/g)].map((m) => m[1]);
+  const allRefs = [...ATTRIBUTE_REFS, ...IMPORT_REFS];
+
+  check("the page has self-referencing assets to check", allRefs.length >= 4, allRefs);
+  check(
+    "no self-referencing asset is un-versioned (this is the whole Fix-1)",
+    allRefs.every((ref) => /[?&]v=/.test(ref)),
+    allRefs.filter((ref) => !/[?&]v=/.test(ref)),
+  );
+  check(
+    "every stamped version equals the manifest version",
+    allRefs.every((ref) => ref.includes("?v=" + version)),
+    allRefs.filter((ref) => !ref.includes("?v=" + version)),
+  );
+  // Spot-check the ones that actually caused the phantom outage.
+  for (const name of ["dashboard.css", "dashboard.js", "dashboard-fetch.js", "dashboard-page.js", "sdk.js"]) {
+    check(`${name} is referenced with the current version`, allRefs.some((ref) => ref.split("?")[0].endsWith(name) && ref.includes("?v=" + version)), allRefs);
+  }
+  // The bridge is imported, so it needs the query in the specifier, not just in a
+  // <script src> that no longer exists.
+  check("the bridge import carries the version query", /from\s*["']\.\/sdk\.js\?v=/.test(pageText), pageText.slice(0, 400));
+}
+
+/* --------------------------- TASK-8 Fix-2: a failed section cannot hide -- */
+
+section("Fix-2: failure is never collapsible");
+{
+  const routeFailure = { kind: "route_failure", transport: "api", status: 403, message: "403" };
+  const backendError = { ok: false, error: { kind: "backend_error", message: "内部错误" } };
+  const outage = { ok: false, error: { kind: "unreachable", message: "down" } };
+  const success = { ok: true, handoff: null };
+  const emptyOk = { ok: true, total: 0, byKind: {}, entries: [] };
+
+  // The predicate: an `ok:false` body and the transport's own descriptor both count
+  // as failures; an `ok:true` body never does, including the legitimately empty one.
+  check("a route_failure descriptor is a failure", transport.sectionFailed(routeFailure) === true);
+  check("a backend_error body is a failure", transport.sectionFailed(backendError) === true);
+  check("an unreachable body is a failure", transport.sectionFailed(outage) === true);
+  check("a successful section is not a failure", transport.sectionFailed(success) === false);
+  check("a legitimately empty section is not a failure", transport.sectionFailed(emptyOk) === false);
+  check("undefined is not a failure (before the first fetch)", transport.sectionFailed(undefined) === false);
+  check("null is not a failure", transport.sectionFailed(null) === false);
+
+  // The rule: a stored collapse preference cannot hide a failure.
+  check("a failed section renders expanded even when the user collapsed it", transport.effectiveCollapsed(routeFailure, true) === false);
+  check("a backend_error section renders expanded too", transport.effectiveCollapsed(backendError, true) === false);
+  check("an outage section renders expanded", transport.effectiveCollapsed(outage, true) === false);
+
+  // B18 semantics must survive untouched for successful sections.
+  check("a successful section keeps a stored collapse", transport.effectiveCollapsed(success, true) === true);
+  check("a successful section keeps a stored expansion", transport.effectiveCollapsed(success, false) === false);
+  check("an empty-but-successful section keeps a stored collapse", transport.effectiveCollapsed(emptyOk, true) === true);
+  check("a section with no data yet uses the stored value", transport.effectiveCollapsed(undefined, true) === true);
+
+  // The render path must actually consult the rule, not just the helper.
+  const requireFromHere = createRequire(import.meta.url);
+  const fs = requireFromHere("node:fs");
+  const path = requireFromHere("node:path");
+  const pageText = fs.readFileSync(path.join(path.dirname(new URL(import.meta.url).pathname), "..", "ui/assets/dashboard-page.js"), "utf8");
+  check("the renderer uses effectiveCollapsed", /effectiveCollapsed\(/.test(pageText), "the rule must be applied when rendering, not only defined");
+  check("the renderer refuses to toggle a failed section", /if\s*\(failed\)\s*return;/.test(pageText), pageText.slice(0, 200));
+  check("a failed section is marked for the stylesheet", /dataset\.failed/.test(pageText));
+}
+
+/* ------------------------ TASK-8 Fix-3: route-level observability --------- */
+
+section("Fix-3: every card route is attributable in the host log");
+{
+  const requireFromHere = createRequire(import.meta.url);
+  const fs = requireFromHere("node:fs");
+  const path = requireFromHere("node:path");
+  const appDir = path.join(path.dirname(new URL(import.meta.url).pathname), "..");
+  const indexText = fs.readFileSync(path.join(appDir, "index.js"), "utf8");
+  const dashboardText = fs.readFileSync(path.join(appDir, "lib/dashboard.js"), "utf8");
+
+  // All four routes must go through the logging wrapper, or one of them stays
+  // invisible — and an invisible route is exactly what made the "79 requests"
+  // question unanswerable.
+  const wrapped = [...indexText.matchAll(/app\.get\(\s*["']\/api\/([a-z]+)["']\s*,\s*section\(/g)].map((m) => m[1]);
+  check("all four dashboard routes are wrapped by the logging helper", wrapped.length === 4, wrapped);
+  check("the four routes are status/handoff/memory/hooks", JSON.stringify(wrapped.sort()) === JSON.stringify(["handoff", "hooks", "memory", "status"]), wrapped);
+
+  check("an entry line is logged", /dashboard route enter:/.test(indexText));
+  check("an exit line is logged", /dashboard route exit:/.test(indexText));
+  check("the exit line carries the route name", /dashboard route exit: \$\{name\}/.test(indexText));
+  check("the exit line carries ok/kind/duration", /ok=\$\{meta\.ok\} kind=\$\{meta\.kind\}/.test(indexText) && /durationMs=\$\{durationMs\}/.test(indexText));
+  check("the route name is not interpolated from user input", /section\("status"/.test(indexText), "route names must be literals, never request-derived");
+
+  // Metadata only: the exit line must not interpolate a payload body.
+  const exitLine = (indexText.match(/dashboard route exit:[\s\S]{0,400}?\);/) || [""])[0];
+  check("the exit line never interpolates the payload", !/payload\b/.test(exitLine), exitLine.slice(0, 200));
+  check("the metadata helper reports no free text field", !/message:|body:|token|credential|scopeId:/i.test((dashboardText.match(/export function sectionMeta[\s\S]*?\n}/) || [""])[0]));
+
+  // sectionMeta must report the SAME kind the payload body carries, for each of the
+  // three section shapes. This is not cosmetic: the exit log is the only thing that
+  // makes a card request attributable (the whole point of Fix-3), and a log that
+  // names the wrong branch is worse than no log. An earlier version of this helper
+  // reported `backend_error` for a genuinely `unreachable` status payload, because
+  // it did not know status nests its error under `server.error` — caught by the
+  // route-invocation harness, not by any unit assertion.
+  check("a healthy hooks payload classifies as ok", sectionMeta("hooks", { ok: true, counters: {} }).kind === "ok");
+  check("a healthy status payload classifies as ok", sectionMeta("status", { ok: true, server: { ok: true } }).kind === "ok");
+  check("a top-level route_failure keeps its kind", sectionMeta("x", { kind: "route_failure" }).kind === "route_failure");
+  check("a handoff-shaped error keeps its kind", sectionMeta("handoff", { ok: false, error: { kind: "unreachable" } }).kind === "unreachable");
+  check("a memory-shaped error keeps its kind", sectionMeta("memory", { ok: false, error: { kind: "backend_error" } }).kind === "backend_error");
+  check(
+    "a status-shaped network failure reports unreachable, not backend_error",
+    sectionMeta("status", { ok: false, baseUrl: "http://127.0.0.1:8000", server: { ok: false, error: { kind: "unreachable" } } }).kind === "unreachable",
+    sectionMeta("status", { ok: false, server: { ok: false, error: { kind: "unreachable" } } }),
+  );
+  check(
+    "a status-shaped internal failure reports backend_error",
+    sectionMeta("status", { ok: false, baseUrl: null, configError: { kind: "backend_error" }, server: { ok: false, error: { kind: "backend_error" } } }).kind === "backend_error",
+  );
+  check("an ok:false body with no kind anywhere still classifies", sectionMeta("x", { ok: false }).kind === "backend_error");
+  check("hasAddress reports presence without the value", sectionMeta("status", { ok: true, baseUrl: "http://127.0.0.1:8000" }).hasAddress === true);
+  check("hasAddress is false for a null address", sectionMeta("status", { ok: false, baseUrl: null }).hasAddress === false);
+  check("failedSections counts a failed server", sectionMeta("status", { ok: false, server: { ok: false } }).failedSections === 1);
+  check("failedSections counts a config error", sectionMeta("status", { ok: false, configError: { kind: "backend_error" } }).failedSections === 1);
+  check("failedSections is zero on success", sectionMeta("handoff", { ok: true }).failedSections === 0);
+}
+
+/* -------------------- TASK-8 Fix-4: internal errors are not outages ------ */
+
+section("Fix-4: only network failures may render as a Server outage");
+{
+  // The allow-list is the whole safety property: anything outside it is this App's
+  // problem and must not tell the user to go start a Server.
+  check("unreachable is a network failure", isNetworkFailure("unreachable") === true);
+  check("network_not_declared is a network failure", isNetworkFailure("network_not_declared") === true);
+  check("http_error is NOT a network failure", isNetworkFailure("http_error") === false);
+  check("not_json is NOT a network failure", isNetworkFailure("not_json") === false);
+  check("read_failed is NOT a network failure", isNetworkFailure("read_failed") === false);
+  check("an unknown kind is NOT a network failure", isNetworkFailure("something_new") === false);
+  check("undefined is NOT a network failure", isNetworkFailure(undefined) === false);
+
+  // A config failure must be reported as backend_error, not as an outage, and must
+  // still answer with a payload the card can render.
+  const status = await dashboardStatus({}, () => {
+    throw new Error("config blew up");
+  });
+  check("a throwing config resolver yields ok:false", status.ok === false, status.ok);
+  check("a throwing config resolver yields kind=backend_error", status.server.error.kind === "backend_error", status.server.error);
+  check("the config failure records its origin", status.server.error.origin === "config", status.server.error.origin);
+  check("the config failure keeps the original message", /config blew up/.test(status.server.error.message), status.server.error.message);
+  check("the config failure carries no address", status.baseUrl === null, status.baseUrl);
+  check("the config failure is also flagged as configError", status.configError && status.configError.kind === "backend_error");
+  check("the failed body is still JSON-serialisable", JSON.stringify(status).length > 0);
+
+  // A resolver returning junk is not a throw but is equally unusable.
+  const junk = await dashboardStatus({}, () => ({ nope: true }));
+  check("a resolver without a baseUrl is backend_error too", junk.server.error.kind === "backend_error", junk.server.error);
+
+  // The render branch: backend_error gets its own tone and never the outage copy.
+  const rendered = describeStatusForTest({ ok: false, baseUrl: null, configError: { kind: "backend_error" }, server: { ok: false, stage: "config", error: { kind: "backend_error", origin: "config", message: "config blew up", hint: "查 Hana 日志" } } });
+  check("backend_error renders with the internal tone", rendered.tone === "internal", rendered.tone);
+  check("backend_error says it is unrelated to the Server", /与 Server 无关/.test(rendered.headline + rendered.detail.join(" ")), rendered);
+  check("backend_error never suggests starting the Server", !/start-server\.sh/.test(JSON.stringify(rendered)), rendered);
+  check("backend_error never suggests POWERCONTEXT_HANA_BASE_URL", !/POWERCONTEXT_HANA_BASE_URL/.test(JSON.stringify(rendered)), rendered);
+  check("backend_error shows the error origin", rendered.detail.some((line) => /环节：config/.test(line)), rendered.detail);
+  check("backend_error does not print an empty address", !rendered.detail.some((line) => /^地址：$/.test(line)), rendered.detail);
+  check("backend_error marks showAddress false", rendered.showAddress === false, rendered.showAddress);
+  check("backend_error differs from the outage headline", rendered.headline !== "连不上 Server", rendered.headline);
+
+  // The outage branch must remain reachable, and only for a real network failure.
+  const outage = describeStatusForTest({ ok: false, baseUrl: "http://127.0.0.1:8000", server: { ok: false, stage: "liveness", error: { kind: "unreachable", message: "not reachable", hint: "启动它：scripts/start-server.sh" } } });
+  check("a network failure still renders the outage tone", outage.tone === "down", outage.tone);
+  check("a network failure still shows the address", outage.detail.some((l) => l.includes("127.0.0.1:8000")), outage.detail);
+  check("a network failure still offers the Server fix", /start-server/.test(outage.fix), outage.fix);
+
+  // "地址：未知" is reserved for the outage branch with a genuinely absent address.
+  const noAddress = describeStatusForTest({ ok: false, baseUrl: null, server: { ok: false, stage: "liveness", error: { kind: "unreachable", message: "boom" } } });
+  check("a network failure without an address says 未知", noAddress.detail.some((l) => l === "地址：未知（没有从后端拿到配置）"), noAddress.detail);
+  check("the 未知 wording is absent from the backend_error branch", !JSON.stringify(rendered).includes("地址：未知"), rendered);
 }
 
 section("BUG-3: route failures and Server outages are never confused");

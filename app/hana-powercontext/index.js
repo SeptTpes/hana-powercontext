@@ -22,7 +22,7 @@ import {
   pcUsage,
 } from "./lib/register.js";
 import { registerHooks } from "./lib/hooks.js";
-import { dashboardHooks, dashboardHandoff, dashboardMemory, dashboardStatus } from "./lib/dashboard.js";
+import { dashboardHooks, dashboardHandoff, dashboardMemory, dashboardStatus, runSection } from "./lib/dashboard.js";
 
 export const name = "hana-powercontext";
 
@@ -93,15 +93,42 @@ export default defineApp(async (sdk) => {
   // word, which is why adding the card changes no permission the user must grant.
   try {
     sdk.routes.register((app) => {
-      const json = (c, body) => c.json(body);
+      /**
+       * One route = one logged, self-contained request.
+       *
+       * Fix-3: every card request is attributable in the host log. Before this,
+       * "did the card even call us?" was unanswerable — the host logs the route
+       * *rejection* but not the handler, so a 79-request traffic question could not
+       * be attributed to anyone. Entry and exit are logged with metadata only:
+       * route name, outcome kind, HTTP status, duration, and booleans. No payload
+       * body, no Scope id, no credential.
+       *
+       * Fix-4: `runSection` also guarantees a throw becomes a `backend_error`
+       * payload instead of a 500, so the card always has something specific to
+       * render and the exit line can name it.
+       */
+      const section = (name, work) => async (c) => {
+        await sdk.logger.info(`hana-powercontext dashboard route enter: ${name}`);
+        const { payload, meta, durationMs } = await runSection(name, configNow, (resolve) => work(resolve, c));
+        await sdk.logger.info(
+          `hana-powercontext dashboard route exit: ${name} status=200 ok=${meta.ok} kind=${meta.kind} ` +
+            `hasAddress=${meta.hasAddress} failed=${meta.failedSections} durationMs=${durationMs}`,
+        );
+        // A failed section is still a 200: the card must render the failure, and a
+        // 500 would leave it with nothing to say.
+        return c.json(payload);
+      };
 
-      app.get("/api/status", async (c) => json(c, await dashboardStatus(sdk, configNow())));
-      app.get("/api/handoff", async (c) => json(c, await dashboardHandoff(sdk, configNow())));
-      app.get("/api/memory", async (c) => {
-        const limit = Number(new URL(c.req.url).searchParams.get("limit"));
-        return json(c, await dashboardMemory(sdk, configNow(), { previewLimit: Number.isFinite(limit) && limit > 0 ? limit : 10 }));
-      });
-      app.get("/api/hooks", (c) => json(c, dashboardHooks()));
+      app.get("/api/status", section("status", (resolve) => dashboardStatus(sdk, resolve)));
+      app.get("/api/handoff", section("handoff", (resolve) => dashboardHandoff(sdk, resolve)));
+      app.get(
+        "/api/memory",
+        section("memory", (resolve, c) => {
+          const limit = Number(new URL(c.req.url).searchParams.get("limit"));
+          return dashboardMemory(sdk, resolve, { previewLimit: Number.isFinite(limit) && limit > 0 ? limit : 10 });
+        }),
+      );
+      app.get("/api/hooks", section("hooks", () => Promise.resolve(dashboardHooks())));
     });
     await sdk.logger.info("hana-powercontext registered dashboard routes");
   } catch (error) {

@@ -21,6 +21,10 @@
      what made the original bug misread. A calm slate reads as "this surface needs
      reopening", not "something is down". */
   --pc-reopen: #5a6b7a;
+  /* Fix-4: the App's own backend broke. A third distinct colour, because telling a
+     user "your Server is down" when the Server is fine is the specific lie this
+     round exists to remove. Amber-ish: insistent, not an outage. */
+  --pc-internal: #8a6d1f;
 }
 
 * { box-sizing: border-box; }
@@ -48,6 +52,7 @@ html, body {
 .pc-status[data-tone="down"] { border-left-color: var(--pc-down); }
 .pc-status[data-tone="unknown"] { border-left-color: var(--pc-muted); }
 .pc-status[data-tone="reopen"] { border-left-color: var(--pc-reopen); }
+.pc-status[data-tone="internal"] { border-left-color: var(--pc-internal); }
 
 .pc-dot { width: 9px; height: 9px; border-radius: 50%; margin-top: 5px; flex: none; }
 .pc-status[data-tone="ok"] .pc-dot { background: var(--pc-ok); }
@@ -55,6 +60,7 @@ html, body {
 .pc-status[data-tone="down"] .pc-dot { background: var(--pc-down); }
 .pc-status[data-tone="unknown"] .pc-dot { background: var(--pc-muted); }
 .pc-status[data-tone="reopen"] .pc-dot { background: var(--pc-reopen); }
+.pc-status[data-tone="internal"] .pc-dot { background: var(--pc-internal); }
 
 .pc-status-body { flex: 1; min-width: 0; }
 .pc-headline { font-weight: 600; font-size: 14px; }
@@ -70,6 +76,34 @@ html, body {
 }
 .pc-fix[data-tone="warn"] { background: rgba(184, 134, 11, 0.09); color: var(--pc-warn); }
 .pc-fix[data-tone="reopen"] { background: rgba(90, 107, 122, 0.09); color: var(--pc-reopen); }
+.pc-fix[data-tone="internal"] { background: rgba(138, 109, 31, 0.10); color: var(--pc-internal); }
+
+.pc-section[data-tone="internal"] { border-color: rgba(138, 109, 31, 0.45); }
+.pc-section[data-tone="internal"] .pc-section-title { color: var(--pc-internal); }
+.pc-section[data-tone="internal"] .pc-empty-action {
+  background: rgba(138, 109, 31, 0.08);
+  color: var(--pc-internal);
+}
+
+/* Fix-2: a failed section is always expanded and says so. The flag is the visual
+   promise that the error below it is not hidden by a collapse the user cannot
+   undo; the chevron is turned to show it is pinned open. */
+.pc-section[data-failed="true"] .pc-section-head { cursor: default; }
+.pc-section-flag {
+  margin-left: 6px;
+  padding: 1px 6px;
+  border-radius: 999px;
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  background: rgba(178, 59, 46, 0.12);
+  color: var(--pc-down);
+}
+.pc-section[data-failed="true"][data-tone="reopen"] .pc-section-flag {
+  background: rgba(90, 107, 122, 0.14);
+  color: var(--pc-reopen);
+}
+.pc-section[data-failed="true"] .pc-section-body { display: block; }
 
 /* Section-level reopen tone, so a failed section does not borrow the outage look. */
 .pc-section[data-tone="reopen"] { border-color: rgba(90, 107, 122, 0.45); }

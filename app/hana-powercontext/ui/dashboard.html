@@ -4,7 +4,19 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>PowerContext 看板</title>
-  <link rel="stylesheet" href="./assets/dashboard.css">
+  <!-- Fix-1 (cache busting): every asset this page references carries ?v=<version>.
+       Without it a host that caches the ui/ tree serves the previous build forever,
+       and a fixed card keeps showing the old failure — which is exactly how a
+       "phantom" outage survived several real fixes during the T14 campaign.
+
+       The host controls the cache headers for ui/, so the only lever on this side is
+       the URL. A changed query string is a different URL to every cache.
+
+       The literal below is kept equal to manifest.json's "version" and asserted
+       against it in lib/selftest.mjs — a mismatch fails the suite. It is a literal
+       because the page cannot read the manifest: only ui/ is served to the card, so
+       there is no runtime path to the file. -->
+  <link rel="stylesheet" href="./assets/dashboard.css?v=0.3.4">
 </head>
 <body>
   <main class="pc-root" id="root" aria-busy="true">
@@ -28,8 +40,9 @@
        never runs, and an error thrown inside one does not reach a handler declared
        later — so a fallback living in the module tree could not report the module
        tree's own failure. This is the path that matters now: dashboard-page.js is a
-       module that statically imports ./assets/sdk.js, so if that bridge is missing
-       or corrupt, the page would otherwise sit on "正在连接…" forever. -->
+       module that statically imports ./sdk.js (the bridge sits next to it in ui/),
+       so if that bridge is missing or corrupt, the page would otherwise sit on
+       "正在连接…" forever. -->
   <script>
     window.addEventListener('error', function () {
       // Only speak while the card has not booted. The scaffold's starter fires this
@@ -54,14 +67,14 @@
 
        dashboard-fetch.js owns the credential door (BUG-3); dashboard.js stays pure
        so both can be asserted without a DOM. -->
-  <script src="./assets/dashboard.js"></script>
-  <script src="./assets/dashboard-fetch.js"></script>
+  <script src="./assets/dashboard.js?v=0.3.4"></script>
+  <script src="./assets/dashboard-fetch.js?v=0.3.4"></script>
 
   <!-- The wiring is a MODULE because it must import the hana browser bridge.
        `sdk.js` is an ES module (package/dist/ui.js): a classic <script src> would
        be a syntax error, and without this import there is no globalThis.hana at all
        — hana.api.fetch, hana.state and hana.lifecycle all silently vanish, which is
        exactly the BUG-3/BUG-4 defect. -->
-  <script type="module" src="./assets/dashboard-page.js"></script>
+  <script type="module" src="./assets/dashboard-page.js?v=0.3.4"></script>
 </body>
 </html>

@@ -36,7 +36,11 @@
  * resolution, network declaration, timeout and fail-open behaviour as the tools.
  */
 
-import { hana } from "./sdk.js";
+// Fix-1: the bridge is version-stamped too. It is imported rather than a
+// <script src>, but it is still an asset the host may cache, and a stale bridge
+// reintroduces BUG-4 — hana.* silently missing. Keep this query equal to
+// manifest.json's version; lib/selftest.mjs asserts both against the manifest.
+import { hana } from "./sdk.js?v=0.3.4";
 
 (function main() {
   "use strict";
@@ -174,19 +178,39 @@ import { hana } from "./sdk.js";
 
   function renderSection(key, model, bodyBuilder) {
     const section = el("section", "pc-section");
-    section.dataset.collapsed = state.collapsed[key] ? "true" : "false";
+
+    // Fix-2: a failed section is always expanded, and cannot be collapsed at all.
+    // Its body IS the error; hiding it would recreate the "invisible failure" this
+    // campaign spent three rounds chasing (a 403 drawn as an outage, a stale asset
+    // drawn as a dead Server, a failed section drawn as an empty area).
+    const data = state.data ? state.data[key] : undefined;
+    const failed = transport.sectionFailed(data);
+    const collapsed = transport.effectiveCollapsed(data, state.collapsed[key]);
+
+    section.dataset.collapsed = collapsed ? "true" : "false";
+    section.dataset.failed = failed ? "true" : "false";
     // Carry the tone onto the section so a backend failure cannot look like an
     // outage section; the stylesheet keys off this.
     section.dataset.tone = model.tone || "ok";
 
     const head = el("div", "pc-section-head");
     head.appendChild(el("span", "pc-section-title", model.title));
-    head.appendChild(el("span", "pc-chevron", "\u25bc"));
+    // A failed section advertises that it is open for a reason.
+    if (failed) head.appendChild(el("span", "pc-section-flag", "失败"));
+    head.appendChild(el("span", "pc-chevron", failed ? "\u25be" : "\u25bc"));
     head.setAttribute("role", "button");
     head.setAttribute("tabindex", "0");
-    head.setAttribute("aria-expanded", state.collapsed[key] ? "false" : "true");
+    head.setAttribute("aria-expanded", collapsed ? "false" : "true");
+    if (failed) {
+      head.setAttribute("aria-disabled", "true");
+      head.title = "这一区加载失败，错误内容不会被折叠隐藏。";
+    }
 
     const toggle = async () => {
+      // Refuse to hide an error. `state.collapsed` is deliberately left untouched
+      // so a later successful load restores the user's own preference rather than
+      // inheriting the forced-expanded state.
+      if (failed) return;
       state.collapsed[key] = !state.collapsed[key];
       section.dataset.collapsed = state.collapsed[key] ? "true" : "false";
       head.setAttribute("aria-expanded", state.collapsed[key] ? "false" : "true");

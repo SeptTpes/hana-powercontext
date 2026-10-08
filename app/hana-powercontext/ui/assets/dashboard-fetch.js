@@ -239,6 +239,44 @@
     return true;
   }
 
+  /* -------------------------------------------------- failure visibility -- */
+
+  /**
+   * Did this section fail to load?
+   *
+   * Fix-2 rests on this predicate, which is why it is a named, tested function
+   * rather than an inline `!` somewhere in the render path. Two shapes arrive here:
+   *
+   *   * the transport's own `route_failure` descriptor, which has no `ok` field
+   *     (`loadSection` returns it directly rather than wrapping it), and
+   *   * the backend's body, which carries `ok: false` when the section's work
+   *     failed.
+   *
+   * A body with `ok: true` is a success — including an `ok: true, handoff: null`
+   * empty Handoff, which is a *normal* answer and must stay collapsible like any
+   * other successful section.
+   */
+  function sectionFailed(section) {
+    if (!section || typeof section !== "object") return false;
+    if (section.ok === false) return true;
+    // The route-failure descriptor: identified by its own kind, since it has no ok.
+    return section.kind === "route_failure" || section.kind === "backend_error";
+  }
+
+  /**
+   * The collapse state a section should actually render with.
+   *
+   * A failed section is ALWAYS expanded, whatever the user last chose. Its content
+   * is the error — the reason the card exists on a bad day — and a collapsed failed
+   * section is an invisible failure, which is the single defect this whole
+   * campaign kept finding. Collapse preference applies only to sections that
+   * loaded.
+   */
+  function effectiveCollapsed(section, storedValue) {
+    if (sectionFailed(section)) return false;
+    return Boolean(storedValue);
+  }
+
   const api = {
     counters,
     resetCounters,
@@ -246,6 +284,8 @@
     readCollapsed,
     writeCollapsed,
     collapseKey,
+    sectionFailed,
+    effectiveCollapsed,
     loadSection,
     request,
     routesBaseFrom,

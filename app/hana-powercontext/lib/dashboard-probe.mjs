@@ -39,6 +39,12 @@ const pageSource = readUi("assets/dashboard-page.js");
 const bridgeSource = readUi("assets/sdk.js");
 /** `src` attributes in document order — a bare indexOf would match comments. */
 const scriptSrcs = [...htmlSource.matchAll(/<script\b[^>]*\bsrc=["']([^"']+)["'][^>]*>/g)].map((m) => m[1]);
+/**
+ * A URL's path part, with the `?v=` cache key (Fix-1) and any fragment removed.
+ * Every self-reference now carries a version query, so name matching has to ignore
+ * it — comparing a raw URL against a bare filename silently stops matching.
+ */
+const pathnameOf = (src) => String(src).split("?")[0].split("#")[0];
 
 let failures = 0;
 let checks = 0;
@@ -584,17 +590,18 @@ section("BUG-4: the card imports the hana browser bridge as a module");
   check("the bridge reads the surface-session credential", bridgeSource.includes("appSurfaceSession"));
   check("the bridge exports hana by name", /export\s*\{[\s\S]{0,200}?hana2 as hana/.test(bridgeSource));
 
-  check("the page imports the bridge from ./sdk.js", /import\s*\{\s*hana\s*\}\s*from\s*["']\.\/sdk\.js["']/.test(pageSource), pageSource.slice(0, 160));
+  // Fix-1 stamps the specifier with ?v=, so the query is allowed but not required.
+  check("the page imports the bridge from ./sdk.js", /import\s*\{\s*hana\s*\}\s*from\s*["']\.\/sdk\.js(\?v=[^"']*)?["']/.test(pageSource), pageSource.slice(0, 160));
   check("the import is a static top-level import (not dynamic)", !/import\s*\(/.test(pageSource.split("import { hana }")[0]), "expected no dynamic import before the bridge import");
 
   // A classic <script src> of an ES module is a syntax error — assert the page
   // never does it, and that the wiring really is type=module.
-  check("the wiring is loaded as type=module", scriptSrcs.length > 0 && /<script[^>]*type=["']module["'][^>]*src=["'][^"']*dashboard-page\.js["']/.test(htmlSource), scriptSrcs);
-  check("the bridge is not classic-loaded", !scriptSrcs.some((src) => src.endsWith("sdk.js")), scriptSrcs);
+  check("the wiring is loaded as type=module", scriptSrcs.length > 0 && /<script[^>]*type=["']module["'][^>]*src=["'][^"']*dashboard-page\.js(\?v=[^"']*)?["']/.test(htmlSource), scriptSrcs);
+  check("the bridge is not classic-loaded", !scriptSrcs.some((src) => pathnameOf(src).endsWith("sdk.js")), scriptSrcs);
 
   // Classic scripts run before deferred modules, so the globals the module reads
   // are guaranteed present. Assert the order that makes that true.
-  const idx = (name) => scriptSrcs.findIndex((src) => src.endsWith(name));
+  const idx = (name) => scriptSrcs.findIndex((src) => pathnameOf(src).endsWith(name));
   check("the view logic loads before the wiring", idx("dashboard.js") > -1 && idx("dashboard.js") < idx("dashboard-page.js"), scriptSrcs);
   check("the transport loads before the wiring", idx("dashboard-fetch.js") > -1 && idx("dashboard-fetch.js") < idx("dashboard-page.js"), scriptSrcs);
 }
@@ -668,6 +675,98 @@ section("BUG-4: the page threads hana explicitly (route b)");
     await transport.loadSection("status", { hana: stub });
     return used && transport.counters.api_fetch === 1;
   })());
+}
+
+/* ------------------------------ TASK-8 Fix-1: cache-busted asset URLs ---- */
+
+section("Fix-1: no self-referencing asset is left un-versioned");
+{
+  const htmlRefs = [...htmlSource.matchAll(/(?:href|src)=["'](\.\/[^"']+)["']/g)].map((m) => m[1]);
+  const importRefs = [...pageSource.matchAll(/from\s*["'](\.\/[^"']+)["']/g)].map((m) => m[1]);
+  const refs = [...htmlRefs, ...importRefs];
+  const manifestVersion = JSON.parse(readUi("../manifest.json")).version;
+
+  check("the card references several of its own assets", refs.length >= 4, refs);
+  check("none of them is un-versioned", refs.every((ref) => /[?&]v=/.test(ref)), refs.filter((ref) => !/[?&]v=/.test(ref)));
+  check("all of them match the manifest version", refs.every((ref) => ref.includes("?v=" + manifestVersion)), refs.filter((ref) => !ref.includes("?v=" + manifestVersion)));
+  // The two that actually produced the phantom outage: the wiring and the bridge.
+  check("the wiring carries the cache key", refs.some((ref) => ref.includes("dashboard-page.js?v=")), refs);
+  check("the bridge import carries the cache key", importRefs.some((ref) => ref.includes("sdk.js?v=")), importRefs);
+}
+
+/* -------------------------- TASK-8 Fix-2: a failure cannot be hidden ---- */
+
+section("Fix-2: a failed section renders expanded and refuses to collapse");
+{
+  const routeFailure = { kind: "route_failure", transport: "api", status: 403, message: "403" };
+  const backendErr = { ok: false, error: { kind: "backend_error", message: "内部" } };
+  const outage = { ok: false, error: { kind: "unreachable", message: "down" } };
+  const okEmpty = { ok: true, handoff: null };
+
+  check("a route failure is detected as a failure", transport.sectionFailed(routeFailure) === true);
+  check("a backend_error is detected as a failure", transport.sectionFailed(backendErr) === true);
+  check("an outage is detected as a failure", transport.sectionFailed(outage) === true);
+  check("a success is not a failure", transport.sectionFailed(okEmpty) === false);
+  check("the legitimate empty Handoff is not a failure", transport.sectionFailed({ ok: true, handoff: null, status: "empty" }) === false);
+
+  // The rule under test: a stored "collapsed" preference loses to a failure.
+  check("a collapsed failed section renders expanded", transport.effectiveCollapsed(backendErr, true) === false);
+  check("a collapsed outage section renders expanded", transport.effectiveCollapsed(outage, true) === false);
+  check("a collapsed route failure renders expanded", transport.effectiveCollapsed(routeFailure, true) === false);
+  // B18 semantics for the healthy case must be untouched by Fix-2.
+  check("a collapsed successful section stays collapsed (B18 preserved)", transport.effectiveCollapsed(okEmpty, true) === true);
+  check("an expanded successful section stays expanded", transport.effectiveCollapsed(okEmpty, false) === false);
+
+  // And the wiring must actually use it, not merely define it.
+  check("the wiring consults the rule when rendering", /effectiveCollapsed\(/.test(pageSource));
+  check("the wiring refuses to toggle a failed section", /if\s*\(failed\)\s*return;/.test(pageSource));
+  check("a failed section is flagged for the stylesheet", /dataset\.failed/.test(pageSource));
+}
+
+/* ------------------- TASK-8 Fix-4: internal errors never wear the outage -- */
+
+section("Fix-4: only network failures may render as an outage");
+{
+  // Route-level: the classifier's allow-list.
+  check("unreachable keeps the outage right", await (async () => {
+    const s = await dashboardStatus({}, () => ({ baseUrl: "http://127.0.0.1:8000" }));
+    return s && typeof s.ok === "boolean";
+  })());
+  check("a throwing config resolver becomes backend_error, not unreachable", await (async () => {
+    const s = await dashboardStatus({}, () => {
+      throw new Error("boom");
+    });
+    return s.ok === false && s.server.error.kind === "backend_error" && s.server.error.origin === "config";
+  })());
+
+  // View-level: the two branches must not share copy or tone.
+  const internal = view.describeStatus({
+    ok: false,
+    baseUrl: null,
+    configError: { kind: "backend_error" },
+    server: { ok: false, stage: "config", error: { kind: "backend_error", origin: "config", message: "配置解析抛错", hint: "查 Hana 日志" } },
+  });
+  check("backend_error is toned internal", internal.tone === "internal", internal.tone);
+  check("backend_error names itself unrelated to the Server", /与 Server 无关/.test(internal.headline), internal.headline);
+  check("backend_error carries no Server repair command", !/start-server/.test(JSON.stringify(internal)), internal);
+  check("backend_error carries no base-url advice", !/POWERCONTEXT_HANA_BASE_URL/.test(JSON.stringify(internal)), internal);
+  check("backend_error does not print an empty address", !internal.detail.some((l) => /^地址：$/.test(l)), internal.detail);
+
+  const outage = view.describeStatus({
+    ok: false,
+    baseUrl: "http://127.0.0.1:8000",
+    server: { ok: false, stage: "liveness", error: { kind: "unreachable", message: "not reachable", hint: "启动它：scripts/start-server.sh" } },
+  });
+  check("a real network failure still gets the outage tone", outage.tone === "down", outage.tone);
+  check("a real network failure still shows the address", outage.detail.some((l) => l.includes("127.0.0.1:8000")), outage.detail);
+  check("the two branches do not share a headline", internal.headline !== outage.headline, [internal.headline, outage.headline]);
+
+  // Section-level: a backend_error section must not be toned like an outage.
+  const section = view.describeHandoff({ ok: false, error: { kind: "backend_error", message: "内部" } });
+  check("a backend_error section is toned internal", section.tone === "internal", section.tone);
+  check("a backend_error section does not send the reader to the Server", !/先让 Server 恢复/.test(section.action), section.action);
+  const memorySection = view.describeMemory({ ok: false, error: { kind: "backend_error", message: "内部" } });
+  check("a backend_error memory section is toned internal", memorySection.tone === "internal", memorySection.tone);
 }
 
 console.log(`\n=== DASHBOARD PROBE: ${checks - failures}/${checks} checks passed ${failures === 0 ? "— ALL PASSED" : "— " + failures + " FAILED"} ===`);

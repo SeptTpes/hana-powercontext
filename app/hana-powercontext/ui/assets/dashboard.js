@@ -68,10 +68,39 @@
     }
 
     if (!status.ok) {
-      const stage = status.server && status.server.stage === "readiness" ? "服务未就绪" : "连不上 Server";
       const error = status.server && status.server.error ? status.server.error : {};
+
+      // --- Fix-4: the App's own backend broke — NOT an outage ------------------
+      //
+      // Everything that is not a network-layer failure lands here: a config or
+      // Scope resolution error, a malformed answer, an unexpected throw in the
+      // handler. The Server may be perfectly healthy, so this must never wear the
+      // outage banner and must never tell the reader to start a Server.
+      //
+      // This is the branch that was missing when a stale asset plus an internal
+      // error rendered as "连不上 Server / 地址：未知" against a Server that was up
+      // and serving hook traffic. Amber, not red: insistent, not an outage.
+      if (error.kind === "backend_error" || (status.configError && !status.baseUrl)) {
+        const detail = [error.message || "看板后端出现内部错误。"];
+        if (error.origin) detail.push("环节：" + text(error.origin));
+        if (error.cause) detail.push(text(error.cause));
+        detail.push("这是看板自己的错误，与 PowerContext Server 无关。");
+        return {
+          tone: "internal",
+          headline: "看板后端内部错误（与 Server 无关）",
+          detail,
+          fix: error.hint || "这是 App 侧的问题：查看 Hana 日志里 hana-powercontext 的路由记录，或重载 App。",
+          // No address is meaningful here, and printing an empty one is how the
+          // original confusion started.
+          showAddress: false,
+        };
+      }
+
+      const stage = status.server && status.server.stage === "readiness" ? "服务未就绪" : "连不上 Server";
       // The address is only meaningful when a real payload carried one. Without
-      // it the outage line reads as incomplete, which is the honest signal.
+      // it the outage line reads as incomplete, which is the honest signal. Per
+      // TASK-8 §Fix-4 this wording is reserved for exactly this branch: a
+      // network-layer failure that really did not produce an address.
       const address = text(status.baseUrl);
       return {
         tone: "down",
@@ -151,13 +180,26 @@
     }
     if (!section.ok) {
       const routeFailure = section.error && section.error.kind === "route_failure";
+      const internal = section.error && section.error.kind === "backend_error";
       return {
-        // A route failure gets its own tone so the section cannot be mistaken for
-        // a Server outage, and never tells the reader to go fix the Server.
-        tone: routeFailure ? "reopen" : "down",
+        // A route failure or an App-internal error gets its own tone so the section
+        // cannot be mistaken for a Server outage, and neither tells the reader to go
+        // fix the Server. Only a genuine network failure earns the "down" look.
+        tone: routeFailure ? "reopen" : internal ? "internal" : "down",
         title: "最新 Handoff",
+        // The fallback action must match the cause. Telling a reader to wait for
+        // the Server when the App itself broke is the same misdirection as the
+        // outage banner on an internal error — just in one line instead of a
+        // banner. Only the genuine network branch may mention the Server.
+        action:
+          section.error && section.error.hint
+            ? section.error.hint
+            : routeFailure
+              ? "关闭这张卡片并重新打开。"
+              : internal
+                ? "看板自身出错：查看 Hana 日志里的路由记录，或重载 App。"
+                : "先让 Server 恢复，再点刷新。",
         lines: [section.error && section.error.message ? section.error.message : "取交接状态失败。"],
-        action: section.error && section.error.hint ? section.error.hint : "先让 Server 恢复，再点刷新。",
       };
     }
     if (!section.handoff) {
@@ -192,13 +234,22 @@
     }
     if (!section.ok) {
       const routeFailure = section.error && section.error.kind === "route_failure";
+      const internal = section.error && section.error.kind === "backend_error";
       return {
-        tone: routeFailure ? "reopen" : "down",
+        tone: routeFailure ? "reopen" : internal ? "internal" : "down",
         title: "记忆",
+        // Same rule as the Handoff section: the remedy must name the actual cause.
+        action:
+          section.error && section.error.hint
+            ? section.error.hint
+            : routeFailure
+              ? "关闭这张卡片并重新打开。"
+              : internal
+                ? "看板自身出错：查看 Hana 日志里的路由记录，或重载 App。"
+                : "先让 Server 恢复，再点刷新。",
         counts: [],
         entries: [],
         note: section.error && section.error.message ? section.error.message : "取记忆清单失败。",
-        action: section.error && section.error.hint ? section.error.hint : "先让 Server 恢复，再点刷新。",
       };
     }
     if (!section.total) {
