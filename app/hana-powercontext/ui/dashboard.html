@@ -32,6 +32,12 @@
        or corrupt, the page would otherwise sit on "正在连接…" forever. -->
   <script>
     window.addEventListener('error', function () {
+      // Only speak while the card has not booted. The scaffold's starter fires this
+      // on ANY error event (capture phase, so it also sees resource failures), and
+      // copied literally it would let an unrelated late error — a failed icon, a
+      // stylesheet — overwrite the status of a perfectly working card. Before boot
+      // the message is the whole point; after boot it would be a lie.
+      if (window.__pcCardBooted) return;
       var headline = document.getElementById('boot-headline');
       if (headline) headline.textContent = '卡片脚本未能启动';
       var detail = document.getElementById('boot-detail');

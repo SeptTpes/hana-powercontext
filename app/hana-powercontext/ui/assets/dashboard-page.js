@@ -36,7 +36,7 @@
  * resolution, network declaration, timeout and fail-open behaviour as the tools.
  */
 
-import { hana } from "./assets/sdk.js";
+import { hana } from "./sdk.js";
 
 (function main() {
   "use strict";
@@ -300,6 +300,12 @@ import { hana } from "./assets/sdk.js";
     // One fetch on mount. No polling: a card that polls puts a permanent load on
     // the Server for a surface the user may not even be looking at.
     await refresh();
+
+    // Tell the inline startup fallback to stand down. It exists for the case where
+    // this module never runs at all (a missing or corrupt sdk.js); now that the card
+    // has rendered, an unrelated later error must not relabel a working card as
+    // "脚本未能启动".
+    window.__pcCardBooted = true;
 
     // If the host re-mounts or restores this card, re-render from the same data
     // rather than fetching again.

@@ -1037,7 +1037,7 @@ section("BUG-3: the card has exactly one door, and it carries credentials");
 
   // (5) Version, and the manifest is otherwise untouched by this fix.
   const manifest = JSON.parse(readAppFile("manifest.json"));
-  check("the version is 0.3.2", manifest.version === "0.3.2", manifest.version);
+  check("the version is 0.3.3", manifest.version === "0.3.3", manifest.version);
   check("the capabilities are unchanged by the fix", JSON.stringify(manifest.capabilities) === JSON.stringify(["app/tools.expose-to-model", "app/hooks.agent-pre-step", "app/hooks.agent-before-start"]), manifest.capabilities);
   check("the card contribution is unchanged by the fix", manifest.contributes.cards.length === 1 && manifest.contributes.cards[0].route === "/dashboard.html", manifest.contributes);
 
@@ -1058,7 +1058,7 @@ section("BUG-3: the card has exactly one door, and it carries credentials");
 
   // The page must pull the bridge in as a module. A classic <script src> would be a
   // syntax error, and no import at all means no hana — the original defect.
-  check("the card page imports the bridge as a module", /import\s*\{[^}]*\bhana\b[^}]*\}\s*from\s*["']\.\/assets\/sdk\.js["']/.test(page), page.slice(0, 200));
+  check("the card page imports the bridge as a module", /import\s*\{[^}]*\bhana\b[^}]*\}\s*from\s*["']\.\/sdk\.js["']/.test(page), page.slice(0, 200));
   check("the card page is loaded as type=module", /<script[^>]*type=["']module["'][^>]*src=["'][^"']*dashboard-page\.js["']/.test(html), html.slice(-500));
   check("the page does not classic-load the bridge (that would be a syntax error)", !/<script(?![^>]*type=["']module["'])[^>]*src=["'][^"']*sdk\.js["']/.test(html));
   // Order must be read from the actual `src` attributes: a naive indexOf also
@@ -1081,6 +1081,10 @@ section("BUG-3: the card has exactly one door, and it carries credentials");
   // fallback would throw on the very path it exists to cover.
   check("the startup target element exists in the page", /id=["']boot-headline["']/.test(html), "expected #boot-headline");
   check("the fallback's detail target also exists", /id=["']boot-detail["']/.test(html), "expected #boot-detail");
+  // The fallback must not be able to clobber a card that booted fine: it fires on
+  // any error event, including an unrelated late resource failure.
+  check("the fallback checks the booted flag before speaking", /__pcCardBooted/.test(html));
+  check("the page raises the booted flag once it has rendered", /__pcCardBooted\s*=\s*true/.test(page));
   check("the startup message is still the connecting skeleton", /正在连接/.test(html));
 
   // Route (b), asserted so a later "simplification" cannot quietly undo it: the

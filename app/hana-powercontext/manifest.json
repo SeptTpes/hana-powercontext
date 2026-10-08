@@ -2,7 +2,7 @@
   "manifestVersion": 2,
   "id": "hana-powercontext",
   "name": "PowerContext",
-  "version": "0.3.2",
+  "version": "0.3.3",
   "description": "Bounded recall and durable handoff for this session, backed by a running PowerContext Server.",
   "entry": "index.js",
   "capabilities": [

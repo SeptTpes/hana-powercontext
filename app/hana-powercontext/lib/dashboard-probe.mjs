@@ -584,7 +584,7 @@ section("BUG-4: the card imports the hana browser bridge as a module");
   check("the bridge reads the surface-session credential", bridgeSource.includes("appSurfaceSession"));
   check("the bridge exports hana by name", /export\s*\{[\s\S]{0,200}?hana2 as hana/.test(bridgeSource));
 
-  check("the page imports the bridge from ./assets/sdk.js", /import\s*\{\s*hana\s*\}\s*from\s*["']\.\/assets\/sdk\.js["']/.test(pageSource), pageSource.slice(0, 120));
+  check("the page imports the bridge from ./sdk.js", /import\s*\{\s*hana\s*\}\s*from\s*["']\.\/sdk\.js["']/.test(pageSource), pageSource.slice(0, 160));
   check("the import is a static top-level import (not dynamic)", !/import\s*\(/.test(pageSource.split("import { hana }")[0]), "expected no dynamic import before the bridge import");
 
   // A classic <script src> of an ES module is a syntax error — assert the page
