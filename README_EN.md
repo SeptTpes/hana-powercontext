@@ -113,7 +113,7 @@ Design invariants: **fail-open** (Server down → no injection / tools answer wi
 
 ## Verification system
 
-This repo treats acceptance as a first-class artifact: `lib/selftest.mjs` (513 checks, including the live section) / `lib/dashboard-probe.mjs` (250) / `lib/hook-probe.mjs` (131) / `lib/live-demo.mjs` (end-to-end against a real Server) / `scripts/verify-fail-open.sh` (degradation semantics). Some acceptance criteria (the capture-enabled side, the kill-switch, the real-host outage hook path) currently rest on **offline assertions only** and have not been exercised on real hardware; see [`docs/VERIFICATION.md`](docs/VERIFICATION.md) for how to re-run them offline.
+This repo treats acceptance as a first-class artifact: `lib/selftest.mjs` (519 checks, including the live section) / `lib/dashboard-probe.mjs` (250) / `lib/hook-probe.mjs` (131) / `lib/live-demo.mjs` (end-to-end against a real Server) / `scripts/verify-fail-open.sh` (degradation semantics). Some acceptance criteria (the capture-enabled side, the kill-switch, the real-host outage hook path) currently rest on **offline assertions only** and have not been exercised on real hardware; see [`docs/VERIFICATION.md`](docs/VERIFICATION.md) for how to re-run them offline.
 
 ## License
 

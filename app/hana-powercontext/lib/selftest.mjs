@@ -1586,20 +1586,23 @@ section("TASK-11 Fix-4/5: manifest description and documentation counts");
   // The bound therefore encodes the failure mode that actually happened twice (a
   // number left behind while the suite grew by hundreds), and the exact figure lives
   // in the suite's own final line, captured to artifacts/stage3/audit-fix-selftest.txt.
-  const DOC_TOLERANCE = 100;
+  const DOC_TOLERANCE = 25;
   const zhMatch = zh.match(/selftest\.mjs\u0060\uff08(\d+) \u9879/);
   const enMatch = en.match(/lib\/selftest\.mjs\u0060?\s*\((\d+) checks/);
   const shippedMatch = readApp("README.md").match(/(\d+) assertions/);
   check("the zh README states a selftest count", Boolean(zhMatch), "expected a number in the verification section");
   check("the en README states a selftest count", Boolean(enMatch), en.slice(0, 200));
   check("the shipped README states a selftest count", Boolean(shippedMatch), "expected N assertions in the dev section");
-  if (zhMatch) {
-    check(
-      "the zh selftest count is not a stale figure",
-      Math.abs(Number(zhMatch[1]) - checks) <= DOC_TOLERANCE,
-      "docs say " + zhMatch[1] + " but the suite has reached " + checks + " (tolerance " + DOC_TOLERANCE + ")",
-    );
-  }
+  // The staleness comparison is deliberately NOT here. At this point `checks` is a
+  // partial count, and a document describing the FINISHED suite is legitimately larger
+  // than it — so every "docs vs checks" assertion written here is unsatisfiable as soon
+  // as the docs are accurate. It lives at the end of the file instead, where `checks`
+  // really is the total. (This cost two attempts to notice; recorded in D48.)
+  globalThis.__pcDocCounts = {
+    zh: zhMatch ? Number(zhMatch[1]) : null,
+    en: enMatch ? Number(enMatch[1]) : null,
+    shipped: shippedMatch ? Number(shippedMatch[1]) : null,
+  };
   if (enMatch) {
     check(
       "the en selftest count matches the zh one",
@@ -1856,7 +1859,28 @@ section("F5: the READMEs do not point at files the public repo does not ship");
   // The replacement pointer must itself exist, or the fix just swaps one dangling
   // reference for another.
   check("the zh README points at docs/VERIFICATION.md", /docs\/VERIFICATION\.md/.test(zh));
-  check("that file actually exists", fs.existsSync(path.join(repoRoot, "docs/VERIFICATION.md")));
+  const verificationPath = path.join(repoRoot, "docs/VERIFICATION.md");
+  check("that file actually exists", fs.existsSync(verificationPath));
+  // Pointing at a real file is only half the fix: that file also has to be current, or
+  // the README has swapped one dangling reference for a misleading one.
+  {
+    const verification = fs.readFileSync(verificationPath, "utf8");
+    const counts = [...verification.matchAll(/(\d+) 项/g)].map((m) => Number(m[1]));
+    check("docs/VERIFICATION.md states per-suite counts", counts.length >= 3, counts);
+    // What can be checked from inside the run, and what cannot:
+    //
+    //   * CANNOT compare against `checks`. That is the count SO FAR; the document
+    //     describes the finished suite, which is legitimately larger. An equality or a
+    //     two-sided bound here is unsatisfiable by construction — the first version of
+    //     this assertion failed for exactly that reason, and no tolerance fixes it.
+    //   * CAN check internal consistency: the structural claims the document makes must
+    //     hold relative to each other. These are the ones that would actually be wrong
+    //     if a count were left behind while a suite grew.
+    const [selftestCount, probeCount, hookCount] = counts;
+    check("the suites are listed in descending size", selftestCount > probeCount && selftestCount > hookCount, counts);
+    check("the per-suite counts are plausible, not placeholders", selftestCount > 300 && probeCount > 100 && hookCount > 50, counts);
+    check("no count is a stale round old figure", !counts.some((v) => v === 117 || v === 429 || v === 432 || v === 487), counts);
+  }
   check("the en README points at it too", /docs\/VERIFICATION\.md/.test(en));
 }
 /* ------------------------------------------------- registration surface -- */
@@ -1935,6 +1959,25 @@ section(`live Server probe (${liveBaseUrl})`);
     check("a bad Scope is reported, not thrown", missing.isError === true, missing);
     check("the bad-Scope error is the Server's own", missing.details.serverCode === "scope_not_found", missing.details);
     console.log(`  (live section used ${calls.length} requests)`);
+  }
+}
+
+/* --------------------------- documentation counts (checked last) ----------- */
+//
+// This is the one place where `checks` is the real total, so it is the only place a
+// "are the docs still accurate?" assertion can be honest. It compares the count stated
+// in the three documents against the suite's actual size.
+{
+  const doc = globalThis.__pcDocCounts || {};
+  const stated = [doc.zh, doc.en, doc.shipped].filter((value) => typeof value === "number");
+  check("the docs state a selftest count at all", stated.length === 3, doc);
+  if (stated.length === 3) {
+    check(
+      "the documented selftest count matches the finished suite",
+      stated.every((value) => Math.abs(value - checks) <= 25),
+      "docs say " + stated.join("/") + " but the suite finished at " + checks,
+    );
+    check("all three documents agree on the count", Math.max(...stated) - Math.min(...stated) <= 2, stated);
   }
 }
 

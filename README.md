@@ -111,7 +111,7 @@ HanaAgent → 扩展管理 → 从本地目录安装（或从发布 zip 安装�
 
 ## 验证体系
 
-本仓库把验收当一等公民：`lib/selftest.mjs`（513 项，含 live 段）/ `lib/dashboard-probe.mjs`（250 项）/ `lib/hook-probe.mjs`（131 项）/ `lib/live-demo.mjs`（真 Server 端到端）/ `scripts/verify-fail-open.sh`（降级语义）。部分验收判据（捕获开启侧 / kill-switch / 真机停机钩子路径）当前仅有**离线断言证据**，尚未在真机上执行；离线复跑说明见 [`docs/VERIFICATION.md`](docs/VERIFICATION.md)。
+本仓库把验收当一等公民：`lib/selftest.mjs`（519 项，含 live 段）/ `lib/dashboard-probe.mjs`（250 项）/ `lib/hook-probe.mjs`（131 项）/ `lib/live-demo.mjs`（真 Server 端到端）/ `scripts/verify-fail-open.sh`（降级语义）。部分验收判据（捕获开启侧 / kill-switch / 真机停机钩子路径）当前仅有**离线断言证据**，尚未在真机上执行；离线复跑说明见 [`docs/VERIFICATION.md`](docs/VERIFICATION.md)。
 
 ## 许可
 

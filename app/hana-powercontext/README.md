@@ -162,7 +162,7 @@ a config override if you made one) is preserved.
 ## Development and validation
 
 ```sh
-# Logic check, no Hana and no Server needed. 513 assertions, including the full
+# Logic check, no Hana and no Server needed. 519 assertions, including the full
 # three-step handoff flow and every failure branch. The live section at the end is
 # skipped automatically when no Server is reachable.
 node lib/selftest.mjs
