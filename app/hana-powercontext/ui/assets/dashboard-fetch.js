@@ -41,6 +41,13 @@
   const SURFACE_SESSION_QUERY = "appSurfaceSession";
 
   /**
+   * This App's own preference route, relative to the App's route namespace.
+   * BUG-7 established that registered paths are route-relative, so the SDK's own
+   * prefix resolution yields /routes/prefs — matching the other four routes.
+   */
+  const PREFS_PATH = "prefs";
+
+  /**
    * Which door was used, and how often. Counts only — no URL, no credential.
    *
    * `fallbacks` is the one worth watching: it counts the times the official door
@@ -54,6 +61,10 @@
     route_errors: 0,
     transport_errors: 0,
     ok: 0,
+    // B25: a preference write that failed. Counted rather than thrown — the toggle
+    // still takes effect for this view, and the user is not interrupted to be told
+    // that a layout choice will not be remembered.
+    pref_write_errors: 0,
   };
 
   function resetCounters() {
@@ -149,9 +160,16 @@
    * only for the case the task calls out: the official door being absent (older
    * host, or a plain browser).
    */
-  async function request(section, { hana, rawPath, fetchImpl, baseUrl } = {}) {
+  async function request(section, { hana, rawPath, fetchImpl, baseUrl, method, body } = {}) {
     const doRaw = fetchImpl || (typeof fetch === "function" ? fetch : null);
     const init = { headers: { accept: "application/json" } };
+    // Writes (the prefs route) need a method and a body; reads leave both unset so
+    // they stay plain GETs.
+    if (method) init.method = method;
+    if (body !== undefined) {
+      init.headers["content-type"] = "application/json";
+      init.body = JSON.stringify(body);
+    }
 
     if (hasApiFetch(hana)) {
       try {
@@ -180,6 +198,58 @@
     } catch (error) {
       return { thrown: error, transport: "raw", response: null };
     }
+  }
+
+  /* --------------------------------------------------- preferences (B25) -- */
+
+  /**
+   * Read the card's persisted preferences from the App's own backend.
+   *
+   * Returns the collapse map, or `{}` on any failure. A card that cannot read its
+   * preferences must still render — it just starts with everything expanded, which
+   * is the default anyway. Failing loudly here would trade a cosmetic loss for a
+   * broken card.
+   */
+  async function readPrefs(options = {}) {
+    const outcome = await request(PREFS_PATH, { ...options, method: "GET" });
+    if (outcome.thrown || !outcome.response || !outcome.response.ok) return {};
+    try {
+      const body = await outcome.response.json();
+      return body && body.prefs && body.prefs.collapsed ? body.prefs.collapsed : {};
+    } catch {
+      return {};
+    }
+  }
+
+  /**
+   * Persist one section's collapse preference.
+   *
+   * The write is a single field, merged server-side, so two cards cannot clobber
+   * each other's unrelated choices. On failure the caller keeps the new state on
+   * screen and the counter records it: the user asked for the section to collapse
+   * and it did — interrupting them to say "that will not be remembered" is noise
+   * about a detail they did not ask about.
+   *
+   * Returns true when the write is known to have landed.
+   */
+  async function writePrefs(section, collapsed, options = {}) {
+    const body = { collapsed: { [section]: Boolean(collapsed) } };
+    const outcome = await request(PREFS_PATH, { ...options, method: "PUT", body });
+    if (outcome.thrown || !outcome.response || !outcome.response.ok) {
+      counters.pref_write_errors += 1;
+      return false;
+    }
+    try {
+      const payload = await outcome.response.json();
+      if (payload && payload.ok === false) {
+        counters.pref_write_errors += 1;
+        return false;
+      }
+    } catch {
+      // An unparseable 200 still means the route accepted the write; the response
+      // body is not what the toggle depends on.
+    }
+    return true;
   }
 
   /**
@@ -304,9 +374,10 @@
     counters,
     resetCounters,
     hasApiFetch,
-    readCollapsed,
-    writeCollapsed,
-    collapseKey,
+    // B25: the live persistence path.
+    readPrefs,
+    writePrefs,
+    PREFS_PATH,
     sectionFailed,
     effectiveCollapsed,
     unwrapStored,
@@ -314,6 +385,10 @@
     request,
     routesBaseFrom,
     routeFailure,
+    // Legacy: these two are the hana.state-era collapse persistence. Retired in
+    // 0.4.0 in favour of readPrefs/writePrefs above; kept because the probe still
+    // exercises them as the record of what B25 was, and because deleting a tested
+    // function is how the evidence for a past decision disappears.
     readCollapsed,
     writeCollapsed,
     collapseKey,

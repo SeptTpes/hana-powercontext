@@ -29,6 +29,7 @@ import {
 } from "./tools.js";
 import { buildToolRegistrations } from "./register.js";
 import { dashboardStatus, dashboardHandoff, dashboardMemory, dashboardHooks, isNetworkFailure, sectionMeta } from "./dashboard.js";
+import { readPrefs, writePrefs } from "./prefs.js";
 
 // The card's view logic is a browser file (UMD-ish: it publishes a global and a
 // CommonJS export), so it is loaded through createRequire rather than imported.
@@ -1049,7 +1050,7 @@ section("BUG-3: the card has exactly one door, and it carries credentials");
 
   // (5) Version, and the manifest is otherwise untouched by this fix.
   const manifest = JSON.parse(readAppFile("manifest.json"));
-  check("the version is 0.3.8", manifest.version === "0.3.8", manifest.version);
+  check("the version is 0.4.0", manifest.version === "0.4.0", manifest.version);
   check("the capabilities are unchanged by the fix", JSON.stringify(manifest.capabilities) === JSON.stringify(["app/tools.expose-to-model", "app/hooks.agent-pre-step", "app/hooks.agent-before-start"]), manifest.capabilities);
   check("the card contribution is unchanged by the fix", manifest.contributes.cards.length === 1 && manifest.contributes.cards[0].route === "/dashboard.html", manifest.contributes);
 
@@ -1106,12 +1107,220 @@ section("BUG-3: the card has exactly one door, and it carries credentials");
   const pageCode = page.replace(/\/\*[\s\S]*?\*\//g, "").split("\n").filter((line) => !/^\s*\//.test(line)).join("\n");
   check("no code reads globalThis.hana (route b keeps the global untouched)", !/globalThis\.hana/.test(pageCode), "route (b) was chosen: thread the imported bridge explicitly");
   check("the imported bridge is handed to the transport", /hana,/.test(pageCode) && /loadSection\(/.test(pageCode), "expected options.hana: hana");
-  check("the state bridge uses the imported binding, not a global", /if \(hana && hana\.state/.test(pageCode), pageCode.slice(0, 200));
+  // B25 retired the state bridge, so the imported binding now reaches the
+  // preferences helpers instead — that is where a read/write actually travels.
+  check("the imported bridge reaches the prefs helpers", /transport\.readPrefs\(\{ hana,/.test(pageCode), "expected transport.readPrefs({ hana, ... })");
+  check("the state bridge is gone (no second persistence system)", !/stateBridge/.test(pageCode), "stateBridge must be deleted, not left alongside");
+  check("the page no longer reads hana.state at all", !/hana\.state/.test(pageCode), "hana.state must not be read for collapse state any more");
   check("the page never assigns a global hana", !/globalThis\.hana\s*=/.test(pageCode));
 }
 
 /* ------------------------------- TASK-8 Fix-1: cache-busting the ui tree -- */
 
+/* ------------------------ B25: preferences in the App's own app-data ----- */
+
+section("B25: prefs persistence (merge / strict booleans / self-heal)");
+{
+  const requireFromHere = createRequire(import.meta.url);
+  const fs = requireFromHere("node:fs");
+  const os = requireFromHere("node:os");
+  const path = requireFromHere("node:path");
+
+  /** A throwaway dataDir per case, so the cases cannot contaminate each other. */
+  function freshDir() {
+    return fs.mkdtempSync(path.join(os.tmpdir(), "pc-prefs-test-"));
+  }
+  function cleanup(dir) {
+    try { fs.rmSync(dir, { recursive: true, force: true }); } catch { /* best effort */ }
+  }
+  const prefsFile = (dir) => path.join(dir, "prefs.json");
+
+  // --- read: absent file is an empty document, not an error ----------------
+  {
+    const dir = freshDir();
+    const result = readPrefs({ dataDir: dir });
+    check("a missing prefs.json reads as an empty map", JSON.stringify(result.prefs.collapsed) === "{}", result.prefs);
+    check("a missing prefs.json is not reported as an error", result.error === null, result.error);
+    check("a missing prefs.json is not 'healed' (nothing to repair)", result.healed === false, result.healed);
+    cleanup(dir);
+  }
+
+  // --- write then read back ------------------------------------------------
+  {
+    const dir = freshDir();
+    const written = writePrefs({ dataDir: dir }, { collapsed: { handoff: true } });
+    check("a write reports success", written.ok === true && written.persisted === true, written);
+    check("the file was actually created", fs.existsSync(prefsFile(dir)), prefsFile(dir));
+    const back = readPrefs({ dataDir: dir });
+    check("the written preference reads back", back.prefs.collapsed.handoff === true, back.prefs);
+    check("the stored file contains only the collapse booleans", Object.keys(JSON.parse(fs.readFileSync(prefsFile(dir), "utf8"))) .join(",") === "collapsed", fs.readFileSync(prefsFile(dir), "utf8"));
+    cleanup(dir);
+  }
+
+  // --- shallow merge: one section at a time must not clobber the other -----
+  {
+    const dir = freshDir();
+    writePrefs({ dataDir: dir }, { collapsed: { handoff: true } });
+    const merged = writePrefs({ dataDir: dir }, { collapsed: { memory: true } });
+    check("a second write merges rather than replaces", merged.prefs.collapsed.handoff === true && merged.prefs.collapsed.memory === true, merged.prefs);
+    const back = readPrefs({ dataDir: dir }).prefs;
+    check("the merge survived the round trip", back.collapsed.handoff === true && back.collapsed.memory === true, back);
+    cleanup(dir);
+  }
+
+  // --- strict booleans -----------------------------------------------------
+  {
+    const dir = freshDir();
+    const out = writePrefs({ dataDir: dir }, { collapsed: { handoff: "true", memory: 1 } });
+    check("a truthy string is dropped, not coerced", out.prefs.collapsed.handoff === undefined, out.prefs.collapsed);
+    check("a number is dropped, not coerced", out.prefs.collapsed.memory === undefined, out.prefs.collapsed);
+    check("nothing was persisted for the junk fields", JSON.stringify(JSON.parse(fs.readFileSync(prefsFile(dir), "utf8")).collapsed) === "{}", fs.readFileSync(prefsFile(dir), "utf8"));
+    // An explicit false is a real preference and must be kept, not treated as absent.
+    const kept = writePrefs({ dataDir: dir }, { collapsed: { handoff: false } });
+    check("an explicit false is stored, not dropped", kept.prefs.collapsed.handoff === false, kept.prefs.collapsed);
+    check("the page can tell 'false' from 'absent'", Object.prototype.hasOwnProperty.call(kept.prefs.collapsed, "handoff"), kept.prefs.collapsed);
+    cleanup(dir);
+  }
+
+  // --- an unknown section name is not stored -------------------------------
+  {
+    const dir = freshDir();
+    const out = writePrefs({ dataDir: dir }, { collapsed: { secrets: true, handoff: true } });
+    check("an unknown section is rejected", out.prefs.collapsed.secrets === undefined, out.prefs.collapsed);
+    check("the known section in the same patch is still stored", out.prefs.collapsed.handoff === true, out.prefs.collapsed);
+    cleanup(dir);
+  }
+
+  // --- corruption self-heals ----------------------------------------------
+  {
+    const dir = freshDir();
+    fs.writeFileSync(prefsFile(dir), "not json{", "utf8");
+    const result = readPrefs({ dataDir: dir });
+    check("a corrupt file reads as empty", JSON.stringify(result.prefs.collapsed) === "{}", result.prefs);
+    check("a corrupt file is reported as healed", result.healed === true, result.healed);
+    const rewritten = fs.readFileSync(prefsFile(dir), "utf8");
+    check("the corrupt file was rewritten as valid JSON", (() => { try { JSON.parse(rewritten); return true; } catch { return false; } })(), rewritten);
+    check("the healed file is empty, not the old junk", JSON.stringify(JSON.parse(rewritten).collapsed) === "{}", rewritten);
+    cleanup(dir);
+  }
+
+  // --- a valid-but-meaningless file is repaired too ------------------------
+  {
+    const dir = freshDir();
+    fs.writeFileSync(prefsFile(dir), JSON.stringify({ junk: 1 }), "utf8");
+    const result = readPrefs({ dataDir: dir });
+    check("a meaningless object reads as empty", JSON.stringify(result.prefs.collapsed) === "{}", result.prefs);
+    check("a meaningless object is repaired", result.healed === true, result.healed);
+    cleanup(dir);
+  }
+
+  // --- no dataDir: degrade, never throw -----------------------------------
+  {
+    let threw = null;
+    let read;
+    let written;
+    try {
+      read = readPrefs({});
+      written = writePrefs({}, { collapsed: { handoff: true } });
+    } catch (error) {
+      threw = error;
+    }
+    check("no dataDir does not throw", threw === null, threw && threw.message);
+    check("no dataDir reads as empty", JSON.stringify(read.prefs.collapsed) === "{}", read);
+    check("no dataDir write reports not-persisted rather than lying", written.persisted === false, written);
+    check("no dataDir write still returns the merged value for the caller's UI", written.prefs.collapsed.handoff === true, written.prefs);
+  }
+
+  // --- the route-level wrapper the page actually calls --------------------
+  {
+    const dir = freshDir();
+    const sdk = { dataDir: dir };
+    // These are the exact calls index.js makes.
+    const read1 = readPrefs(sdk);
+    check("the route payload shape is { collapsed }", read1.prefs && typeof read1.prefs.collapsed === "object", read1.prefs);
+    const put = writePrefs(sdk, { collapsed: { memory: false } });
+    check("the PUT payload shape carries ok + prefs + persisted", put.ok === true && put.prefs && put.persisted === true, put);
+    check("the PUT response is JSON-serialisable", typeof JSON.stringify(put) === "string");
+    const read2 = readPrefs(sdk);
+    check("a value written through the route reads back through the route", read2.prefs.collapsed.memory === false, read2.prefs);
+    cleanup(dir);
+  }
+}
+
+section("B25: the card uses /prefs, and a failed write degrades quietly");
+{
+  const requireFromHere = createRequire(import.meta.url);
+  const fs = requireFromHere("node:fs");
+  const path = requireFromHere("node:path");
+  const appDir = path.join(path.dirname(new URL(import.meta.url).pathname), "..");
+  const pageText = fs.readFileSync(path.join(appDir, "ui/assets/dashboard-page.js"), "utf8");
+  const indexText = fs.readFileSync(path.join(appDir, "index.js"), "utf8");
+
+  // The wiring must use the transport's prefs helpers, and the route must exist.
+  check("the page reads prefs at boot", /state\.collapsed = await loadPrefs\(\)/.test(pageText), pageText.slice(0, 100));
+  check("the toggle persists through savePref", /await savePref\(key, state\.collapsed\[key\]\)/.test(pageText));
+  check("the page no longer calls the legacy writeCollapsed", !/writeCollapsed/.test(pageText));
+  check("the backend registers GET /prefs", /app\.get\("\/prefs"/.test(indexText));
+  check("the backend registers PUT /prefs", /app\.put\("\/prefs"/.test(indexText));
+  check("the prefs routes are not routed through the read-only section wrapper", !/section\(\s*"prefs"/.test(indexText));
+
+  // Footer semantics: the retired meter must be gone and the new label present.
+  check("the footer says the preferences are app-data backed", /折叠偏好（app-data 持久）/.test(pageText));
+  // The old label may still appear in a comment explaining the change; what must be
+  // gone is the rendered line. Assert on the string concatenation that builds it.
+  // The old label may survive in a comment explaining the change; what must be gone
+  // is the rendered line, so the check targets the exact string that built it.
+  check("the retired 视图状态桥 meter is not rendered any more", !pageText.includes('"视图状态桥：读 "'), "the old label must not be concatenated into the footer");
+  check("the footer reports write failures", /pref_write_errors/.test(pageText));
+
+  // Degradation: a failed write must not throw, must count, and must not undo the UI.
+  const transport = requireFromHere("../ui/assets/dashboard-fetch.js");
+  transport.resetCounters();
+  const failing = {
+    api: {
+      async fetch() {
+        throw new Error("prefs route unavailable");
+      },
+    },
+  };
+  let threw = null;
+  let ok = null;
+  try {
+    ok = await transport.writePrefs("handoff", true, { hana: failing });
+  } catch (error) {
+    threw = error;
+  }
+  check("a failed preference write does not throw", threw === null, threw && threw.message);
+  check("a failed preference write returns false", ok === false, ok);
+  check("a failed preference write is counted", transport.counters.pref_write_errors === 1, transport.counters);
+
+  // A failing READ must degrade to the default (expanded), not throw.
+  transport.resetCounters();
+  let readThrew = null;
+  let collapsed = null;
+  try {
+    collapsed = await transport.readPrefs({ hana: failing });
+  } catch (error) {
+    readThrew = error;
+  }
+  check("a failed preference read does not throw", readThrew === null, readThrew && readThrew.message);
+  check("a failed preference read yields an empty map (defaults apply)", JSON.stringify(collapsed) === "{}", collapsed);
+
+  // Success path: an ok:false body counts as a failure even on HTTP 200.
+  transport.resetCounters();
+  const refusing = { api: { async fetch() { return new Response(JSON.stringify({ ok: false, error: "no dataDir" }), { status: 200 }); } } };
+  const refused = await transport.writePrefs("memory", true, { hana: refusing });
+  check("an ok:false body is treated as a failed write", refused === false && transport.counters.pref_write_errors === 1, transport.counters);
+
+  // The write must send exactly one field, so two cards cannot clobber each other.
+  transport.resetCounters();
+  const sent = [];
+  const recorder = { api: { async fetch(path, init) { sent.push({ path, init }); return new Response(JSON.stringify({ ok: true, prefs: { collapsed: {} } }), { status: 200 }); } } };
+  await transport.writePrefs("handoff", true, { hana: recorder });
+  check("the write goes to the App-relative prefs path", sent[0].path === "prefs", sent[0].path);
+  check("the write is a PUT", sent[0].init.method === "PUT", sent[0].init);
+  check("the write body is a single field", JSON.stringify(JSON.parse(sent[0].init.body)) === JSON.stringify({ collapsed: { handoff: true } }), sent[0].init.body);
+}
 section("Fix-1: every self-referencing asset is version-stamped");
 {
   const requireFromHere = createRequire(import.meta.url);

@@ -23,6 +23,7 @@ import {
 } from "./lib/register.js";
 import { registerHooks } from "./lib/hooks.js";
 import { dashboardHooks, dashboardHandoff, dashboardMemory, dashboardStatus, runSection } from "./lib/dashboard.js";
+import { readPrefs, writePrefs } from "./lib/prefs.js";
 
 export const name = "hana-powercontext";
 
@@ -129,6 +130,51 @@ export default defineApp(async (sdk) => {
         }),
       );
       app.get("/hooks", section("hooks", () => Promise.resolve(dashboardHooks())));
+
+      /**
+       * The card's own preferences — B25's fix, and the only thing this App writes
+       * that is not Server state.
+       *
+       * `GET /prefs` and `PUT /prefs` are deliberately NOT routed through
+       * `section()`: that wrapper is for read-only Server sections and always
+       * answers 200 with `ok:false` inside. A preference write has a real failure
+       * mode (a read-only data directory, a full disk), and the card wants to tell
+       * "read, and it was empty" apart from "could not read".
+       *
+       * Both are logged with the same metadata discipline as the sections: shapes
+       * and counts, never values.
+       */
+      app.get("/prefs", async (c) => {
+        await sdk.logger.info("hana-powercontext prefs route enter: get");
+        const result = readPrefs(sdk);
+        await sdk.logger.info(
+          "hana-powercontext prefs route exit: get ok=true healed=" + result.healed +
+            " keys=" + Object.keys(result.prefs.collapsed).length +
+            " error=" + (result.error ? "yes" : "no"),
+        );
+        return c.json({ ok: true, prefs: result.prefs, healed: result.healed, error: result.error });
+      });
+
+      app.put("/prefs", async (c) => {
+        await sdk.logger.info("hana-powercontext prefs route enter: put");
+        let patch = null;
+        try {
+          patch = await c.req.json();
+        } catch {
+          // A body that is not JSON is the caller's bug; say so with a 400 rather
+          // than quietly storing nothing and reporting success.
+          await sdk.logger.info("hana-powercontext prefs route exit: put status=400 invalid-json");
+          return c.json({ ok: false, error: "请求体不是合法 JSON。" }, 400);
+        }
+
+        const result = writePrefs(sdk, patch);
+        await sdk.logger.info(
+          "hana-powercontext prefs route exit: put status=200 ok=" + result.ok +
+            " persisted=" + result.persisted +
+            " keys=" + Object.keys(result.prefs.collapsed).length,
+        );
+        return c.json({ ok: result.ok, prefs: result.prefs, persisted: result.persisted, error: result.error });
+      });
     });
     await sdk.logger.info("hana-powercontext registered dashboard routes");
   } catch (error) {

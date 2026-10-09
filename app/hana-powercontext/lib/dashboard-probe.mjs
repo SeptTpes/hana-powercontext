@@ -683,7 +683,9 @@ section("BUG-4: the page threads hana explicitly (route b)");
   check("no code reads globalThis.hana", !/globalThis\.hana/.test(code), "route (b) means the global is never consulted");
   check("the page never assigns a global hana", !/globalThis\.hana\s*=/.test(code));
   check("the imported bridge reaches the transport", /hana,/.test(code) && /loadSection\(/.test(code));
-  check("the imported bridge reaches the state bridge", /hana\s*&&\s*hana\.state/.test(code));
+  // B25: the binding now reaches the prefs helpers; the state bridge is retired.
+  check("the imported bridge reaches the prefs helpers", /transport\.readPrefs\(\{ hana,/.test(code), "expected transport.readPrefs({ hana, ... })");
+  check("the page no longer reads hana.state at all", !/hana\.state/.test(code), "hana.state must not be read for collapse state any more");
   check("the transport still accepts an injected hana", typeof transport.loadSection === "function");
   check("an injected bridge is what the transport uses", await (async () => {
     transport.resetCounters();
@@ -786,5 +788,89 @@ section("Fix-4: only network failures may render as an outage");
   check("a backend_error memory section is toned internal", memorySection.tone === "internal", memorySection.tone);
 }
 
+/* ------------------------ B25: preferences travel over /prefs ---------- */
+
+section("B25: the card persists collapse preference through its own backend");
+{
+  transport.resetCounters();
+
+  // The read path: the transport must issue a GET to the App-relative prefs path
+  // and hand back the collapse map, with the credential door doing the carrying.
+  const seen = [];
+  const recorder = {
+    api: {
+      async fetch(path, init) {
+        seen.push({ path, init });
+        return new Response(JSON.stringify({ ok: true, prefs: { collapsed: { handoff: true } } }), { status: 200 });
+      },
+    },
+  };
+  const collapsed = await transport.readPrefs({ hana: recorder });
+  check("the read goes to the App-relative prefs path", seen[0].path === transport.PREFS_PATH && seen[0].path === "prefs", seen[0].path);
+  check("the read is a GET", seen[0].init.method === "GET", seen[0].init.method);
+  check("the read carries no body", seen[0].init.body === undefined, seen[0].init.body);
+  check("the read returns the collapse map", collapsed.handoff === true, collapsed);
+  check("the read used the credential door", transport.counters.api_fetch === 1, transport.counters);
+
+  // The response shape the route promises.
+  check("an empty prefs body is tolerated", JSON.stringify(await transport.readPrefs({ hana: { api: { async fetch() { return new Response("{}", { status: 200 }); } } } })) === "{}");
+  check("a prefs body with no collapsed field is tolerated", JSON.stringify(await transport.readPrefs({ hana: { api: { async fetch() { return new Response(JSON.stringify({ ok: true, prefs: {} }), { status: 200 }); } } } })) === "{}");
+
+  // The write path.
+  transport.resetCounters();
+  const writes = [];
+  const writer = { api: { async fetch(path, init) { writes.push({ path, init }); return new Response(JSON.stringify({ ok: true, prefs: { collapsed: {} }, persisted: true }), { status: 200 }); } } };
+  const ok = await transport.writePrefs("memory", false, { hana: writer });
+  check("the write reports success", ok === true, ok);
+  check("the write is a PUT to the prefs path", writes[0].init.method === "PUT" && writes[0].path === "prefs", writes[0]);
+  check("the write sends one field only (so cards cannot clobber each other)", JSON.stringify(JSON.parse(writes[0].init.body)) === JSON.stringify({ collapsed: { memory: false } }), writes[0].init.body);
+  check("an explicit false is sent, not omitted", JSON.parse(writes[0].init.body).collapsed.memory === false);
+  check("the write declares a JSON content type", writes[0].init.headers["content-type"] === "application/json", writes[0].init.headers);
+  check("a successful write does not count as an error", transport.counters.pref_write_errors === 0, transport.counters);
+
+  // Degradation: the toggle already happened on screen, so a failed write must be
+  // counted and swallowed rather than thrown back at the user.
+  transport.resetCounters();
+  const broken = { api: { async fetch() { throw new Error("prefs unavailable"); } } };
+  let threw = null;
+  let failedOk = null;
+  try {
+    failedOk = await transport.writePrefs("handoff", true, { hana: broken });
+  } catch (error) {
+    threw = error;
+  }
+  check("a failed write does not throw (the toggle must stand)", threw === null, threw && threw.message);
+  check("a failed write returns false", failedOk === false, failedOk);
+  check("a failed write increments pref_write_errors", transport.counters.pref_write_errors === 1, transport.counters);
+  check("a failed write is still counted through the legacy counter set", "pref_write_errors" in transport.counters);
+
+  // A 200 whose body says ok:false is a failure too.
+  transport.resetCounters();
+  const refusing = { api: { async fetch() { return new Response(JSON.stringify({ ok: false, error: "no dataDir" }), { status: 200 }); } } };
+  check("an ok:false body is a failed write", (await transport.writePrefs("memory", true, { hana: refusing })) === false && transport.counters.pref_write_errors === 1, transport.counters);
+
+  // A failing read degrades to the default rather than breaking the card.
+  check("a failed read yields an empty map (everything expanded)", JSON.stringify(await transport.readPrefs({ hana: broken })) === "{}");
+}
+
+section("B25: the legacy hana.state helpers are kept, labelled, and unused");
+{
+  // The probe still exercises the retired path on purpose: it is the record of what
+  // B25 was, and deleting a tested function is how the evidence for a past decision
+  // disappears. What matters is that the page no longer calls it.
+  check("the legacy helpers are still exported", typeof transport.readCollapsed === "function" && typeof transport.writeCollapsed === "function");
+  check("the legacy key helper is still exported for the record", transport.collapseKey("handoff") === "collapsed:handoff", transport.collapseKey("handoff"));
+  check("the page does not call writeCollapsed any more", !/writeCollapsed/.test(pageSource), "the live path must be savePref -> PUT /prefs");
+  check("the page does not call readCollapsed any more", !/readCollapsed/.test(pageSource));
+  check("the page's boot reads prefs instead", /state\.collapsed = await loadPrefs\(\)/.test(pageSource));
+  // Comments legitimately mention hana.state (explaining why it was retired), so the
+  // check has to look at executable code only.
+  const pageCodeOnly = pageSource
+    .replace(/\/\*[\s\S]*?\*\//g, "")
+    .split("\n")
+    .filter((line) => !/^\s*\//.test(line))
+    .join("\n");
+  check("the page never touches hana.state in code", !/hana\.state/.test(pageCodeOnly), "hana.state must not be read for collapse state any more");
+}
 console.log(`\n=== DASHBOARD PROBE: ${checks - failures}/${checks} checks passed ${failures === 0 ? "— ALL PASSED" : "— " + failures + " FAILED"} ===`);
 process.exit(failures === 0 ? 0 : 1);

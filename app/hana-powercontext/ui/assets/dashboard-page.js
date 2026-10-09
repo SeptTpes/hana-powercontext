@@ -24,7 +24,7 @@
  *
  * Explicitly (option b), not by assigning a global (option a). The bridge is
  * imported here, at the one place that owns page wiring, and handed to
- * `loadSection`/`readCollapsed`/`writeCollapsed` through their `options`/`bridge`
+ * `loadSection`/`readPrefs`/`writePrefs` through their `options` arguments
  * arguments. That keeps the dependency visible in the code that uses it and
  * leaves `globalThis.hana` untouched — so nothing else in the App can
  * accidentally start depending on an ambient global that only exists inside a
@@ -40,7 +40,7 @@
 // <script src>, but it is still an asset the host may cache, and a stale bridge
 // reintroduces BUG-4 — hana.* silently missing. Keep this query equal to
 // manifest.json's version; lib/selftest.mjs asserts both against the manifest.
-import { hana } from "./sdk.js?v=0.3.8";
+import { hana } from "./sdk.js?v=0.4.0";
 
 (function main() {
   "use strict";
@@ -75,55 +75,67 @@ import { hana } from "./sdk.js?v=0.3.8";
     busy: false,
   };
 
-  /* ------------------------------------------------------------ hana.state -- */
+  /* ------------------------------------------------- preferences (B25) -- */
 
   /**
-   * Instance state, best effort.
+   * Where "is this section collapsed" is remembered, and why not `hana.state`.
    *
-   * `hana.state` is the documented place for a card's own view state, and it
-   * needs no capability word. It is still treated as optional: the page must
-   * render identically in a plain browser (where there is no `hana` at all),
-   * because otherwise the card's logic could only ever be exercised inside a
-   * host — and untestable view logic is how cards ship broken.
+   * This used to live in `hana.state`, through a `stateBridge` object. The 0.3.9
+   * instrumented build settled it: `hana.state` is a card *instance's* private
+   * scratch pad (the SDK's own wording), so it is discarded when the card closes.
+   * The value was written correctly, read correctly, and still never survived a
+   * remount — three rounds of fixes were chasing a store that was never a store.
+   *
+   * Layout preference is not instance state; it is a user preference, and it now
+   * lives in the App's own app-data (`<dataDir>/prefs.json`) through the backend's
+   * GET/PUT /prefs route. That survives reloads, host restarts, and — unlike both
+   * of the previous attempts — an uninstall/reinstall.
+   *
+   * `stateBridge` was deleted rather than left alongside: with the collapse state
+   * moved, it had no remaining caller, and keeping two persistence systems for one
+   * boolean is how the next person ends up debugging the wrong one.
    */
-  const stateDebug = { gets: 0, sets: 0, errors: 0, lastGet: null };
-  const stateBridge = {
-    async get(key, fallback) {
-      stateDebug.gets += 1;
-      try {
-        // `hana` is the imported bridge, not a global. It is still probed rather
-        // than assumed: the object exists as soon as the module loads, but its
-        // `state` face may be absent outside a host-mounted card, and this page
-        // must render identically in a plain browser.
-        if (hana && hana.state && typeof hana.state.get === "function") {
-          const value = await hana.state.get(key);
-          const out = value === undefined || value === null ? fallback : value;
-          stateDebug.lastGet = { key, stored: out === fallback ? "miss" : String(out) };
-          return out;
-        }
-      } catch (error) {
-        stateDebug.errors += 1;
-        stateDebug.lastGet = { key, stored: "error:" + String(error && error.message ? error.message : error).slice(0, 60) };
-      }
-      return fallback;
-    },
-    async set(key, value) {
-      stateDebug.sets += 1;
-      try {
-        if (hana && hana.state && typeof hana.state.set === "function") {
-          await hana.state.set(key, value);
-          stateDebug.lastGet = { key, stored: "written:" + String(value) };
-        } else {
-          stateDebug.errors += 1;
-          stateDebug.lastGet = { key, stored: "no-state-face" };
-        }
-      } catch (error) {
-        stateDebug.errors += 1;
-        stateDebug.lastGet = { key, stored: "set-error:" + String(error && error.message ? error.message : error).slice(0, 60) };
-        /* view state is a convenience; losing it must not break the card */
-      }
-    },
-  };
+  const prefsState = { reads: 0, writes: 0, readErrors: 0, writeErrors: 0, last: "无" };
+
+  /** Read the persisted collapse map. Never throws; `{}` means "nothing stored". */
+  async function loadPrefs() {
+    prefsState.reads += 1;
+    try {
+      const collapsed = await transport.readPrefs({ hana, rawPath: routesBase + "/prefs", fetchImpl: typeof fetch === "function" ? fetch : null });
+      prefsState.last = Object.keys(collapsed).length ? JSON.stringify(collapsed) : "空";
+      return collapsed;
+    } catch (error) {
+      // transport.readPrefs already swallows failures; this is belt-and-braces so
+      // that a future change there cannot take the card's boot down with it.
+      prefsState.readErrors += 1;
+      prefsState.last = "读失败";
+      return {};
+    }
+  }
+
+  /**
+   * Persist one section's collapse preference.
+   *
+   * The visual toggle has already happened by the time this is called, so a write
+   * failure must NOT undo it or interrupt: the user asked for the section to
+   * collapse, and it did. The failure is counted and surfaced in the footer, which
+   * is where "it will not be remembered next time" belongs.
+   */
+  async function savePref(section, collapsed) {
+    prefsState.writes += 1;
+    const ok = await transport.writePrefs(section, collapsed, {
+      hana,
+      rawPath: routesBase + "/prefs",
+      fetchImpl: typeof fetch === "function" ? fetch : null,
+    });
+    if (ok) {
+      prefsState.last = JSON.stringify({ [section]: Boolean(collapsed) });
+    } else {
+      prefsState.writeErrors += 1;
+      prefsState.last = "写失败（本次仍生效）";
+    }
+    return ok;
+  }
 
   /* ---------------------------------------------------------------- fetch -- */
 
@@ -226,9 +238,11 @@ import { hana } from "./sdk.js?v=0.3.8";
       state.collapsed[key] = !state.collapsed[key];
       section.dataset.collapsed = state.collapsed[key] ? "true" : "false";
       head.setAttribute("aria-expanded", state.collapsed[key] ? "false" : "true");
-      // Same unit the probe exercises, so the persistence path under test is the
-      // one the card actually runs.
-      await transport.writeCollapsed(stateBridge, key, state.collapsed[key]);
+      // B25: one field, PUT to the App's own app-data. Failure is counted, not
+      // surfaced — the section did collapse, and that is what the user asked for;
+      // whether it will be remembered next time belongs in the footer, not in a
+      // dialog over the thing they just clicked.
+      await savePref(key, state.collapsed[key]);
     };
     head.addEventListener("click", toggle);
     head.addEventListener("keydown", (event) => {
@@ -293,9 +307,15 @@ import { hana } from "./sdk.js?v=0.3.8";
     // normal case); stated when the bare-fetch fallback took over, because that is
     // the condition BUG-3 proved is not credential-safe in a current host.
     const counters = transport.counters;
+    // B25: this meter used to read "视图状态桥" and report hana.state traffic. That
+    // store is gone — it could never have worked — so the meter now reports the
+    // persistence that does: app-data preferences, read at boot and written on each
+    // toggle. The raw envelope line is dropped; the counts are the useful part, and
+    // the value here is a preference, not a diagnostic puzzle.
     lines.appendChild(el("div", "pc-timestamp",
-      "视图状态桥：读 " + stateDebug.gets + " · 写 " + stateDebug.sets + " · 错 " + stateDebug.errors +
-      " · 末次：" + (stateDebug.lastGet ? (stateDebug.lastGet.key + "=" + stateDebug.lastGet.stored) : "无")
+      "折叠偏好（app-data 持久）：读 " + prefsState.reads + " · 写 " + prefsState.writes +
+      " · 写失败 " + (prefsState.writeErrors + counters.pref_write_errors) +
+      " · 末次 " + prefsState.last
     ));
     if (counters.fallbacks > 0) {
       lines.appendChild(el("div", "pc-timestamp", "注意：本次使用了回退通道（无 hana.api.fetch），可能缺少卡片凭据。"));
@@ -336,7 +356,8 @@ import { hana } from "./sdk.js?v=0.3.8";
   /* ---------------------------------------------------------------- boot -- */
 
   (async function boot() {
-    state.collapsed = await transport.readCollapsed(stateBridge, SECTIONS);
+    // B25: preferences come from the App's own backend, not from card instance state.
+    state.collapsed = await loadPrefs();
     // One fetch on mount. No polling: a card that polls puts a permanent load on
     // the Server for a surface the user may not even be looking at.
     await refresh();
