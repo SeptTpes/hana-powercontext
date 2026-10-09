@@ -51,7 +51,7 @@ powercontext server run             # default http://127.0.0.1:8000
 ### 2. This App
 
 ```bash
-git clone https://github.com/[owner]/hana-powercontext.git
+git clone https://github.com/SeptTpes/hana-powercontext.git
 cd hana-powercontext
 ```
 

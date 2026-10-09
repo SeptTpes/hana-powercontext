@@ -2,7 +2,7 @@
   "manifestVersion": 2,
   "id": "hana-powercontext",
   "name": "PowerContext",
-  "version": "0.4.2",
+  "version": "1.0.0",
   "description": "Durable cross-session memory with bounded pre-step recall and a transferable Handoff workflow, backed by a PowerContext Server.",
   "entry": "index.js",
   "capabilities": [
