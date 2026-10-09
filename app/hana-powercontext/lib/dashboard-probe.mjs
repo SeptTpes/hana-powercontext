@@ -603,6 +603,16 @@ section("BUG-4: the card imports the hana browser bridge as a module");
   check("registrar mounts status at /status (no /api prefix)", /routes\.register\(\(app\)\s*=>\s*\{[\s\S]*?app\.get\("\/status"/.test(indexText || ""), "index.js paths");
   check("registrar mounts no path starting with /api/", !/app\.get\(\s*"\/api\//.test(indexText || ""), "index.js paths");
 
+  // BUG-8: the envelope must unwrap to the raw boolean, and an unknown object
+  // must degrade to "unset" (expanded) rather than to a truthy guess.
+  {
+    const env = transport.unwrapStored({ appId: "a", scope: "card", key: "collapsed:x", value: false });
+    check("the storage envelope unwraps to the stored value", env === false, env);
+    check("a wrapped true unwraps to true", transport.unwrapStored({ value: true }) === true, transport.unwrapStored({ value: true }));
+    check("an unknown object degrades to unset", transport.unwrapStored({ weird: 1 }) === null, transport.unwrapStored({ weird: 1 }));
+    check("a raw boolean passes through untouched", transport.unwrapStored(false) === false, transport.unwrapStored(false));
+  }
+
   check("the wiring is loaded as type=module", scriptSrcs.length > 0 && /<script[^>]*type=["']module["'][^>]*src=["'][^"']*dashboard-page\.js(\?v=[^"']*)?["']/.test(htmlSource), scriptSrcs);
   check("the bridge is not classic-loaded", !scriptSrcs.some((src) => pathnameOf(src).endsWith("sdk.js")), scriptSrcs);
 

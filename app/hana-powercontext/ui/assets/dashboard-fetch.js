@@ -224,10 +224,33 @@
     return `collapsed:${section}`;
   }
 
+  /**
+   * BUG-8: unwrap the storage envelope.
+   *
+   * The host's state API round-trips the value inside an envelope
+   * (`{appId, scope, key, value, ...}` — the same shape the server's
+   * storage GET returns, observable as `[object Object]` in the card's
+   * state-bridge meter). `Boolean(envelope)` is always true, which is how
+   * a single stored collapse made every remount open collapsed forever,
+   * no matter what the user did afterwards.
+   *
+   * Envelope members found in the wild: `value` (the stored value),
+   * `key`, `scope`, `appId`, `updatedAt`. Unknown shapes degrade to
+   * "unset" (expanded) rather than to a guess — an unknown object is not
+   * evidence of a collapse.
+   */
+  function unwrapStored(raw) {
+    if (raw === null || raw === undefined) return null;
+    if (typeof raw !== "object") return raw;
+    if ("value" in raw) return raw.value;
+    return null;
+  }
+
   async function readCollapsed(bridge, sections = DEFAULT_SECTIONS) {
     const out = {};
     for (const section of sections) {
-      const stored = bridge && typeof bridge.get === "function" ? await bridge.get(collapseKey(section), null) : null;
+      const storedRaw = bridge && typeof bridge.get === "function" ? await bridge.get(collapseKey(section), null) : null;
+      const stored = unwrapStored(storedRaw);
       out[section] = stored === null || stored === undefined ? false : Boolean(stored);
     }
     return out;
@@ -286,6 +309,7 @@
     collapseKey,
     sectionFailed,
     effectiveCollapsed,
+    unwrapStored,
     loadSection,
     request,
     routesBaseFrom,

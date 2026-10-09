@@ -40,7 +40,7 @@
 // <script src>, but it is still an asset the host may cache, and a stale bridge
 // reintroduces BUG-4 — hana.* silently missing. Keep this query equal to
 // manifest.json's version; lib/selftest.mjs asserts both against the manifest.
-import { hana } from "./sdk.js?v=0.3.6";
+import { hana } from "./sdk.js?v=0.3.8";
 
 (function main() {
   "use strict";
@@ -86,8 +86,10 @@ import { hana } from "./sdk.js?v=0.3.6";
    * because otherwise the card's logic could only ever be exercised inside a
    * host — and untestable view logic is how cards ship broken.
    */
+  const stateDebug = { gets: 0, sets: 0, errors: 0, lastGet: null };
   const stateBridge = {
     async get(key, fallback) {
+      stateDebug.gets += 1;
       try {
         // `hana` is the imported bridge, not a global. It is still probed rather
         // than assumed: the object exists as soon as the module loads, but its
@@ -95,19 +97,29 @@ import { hana } from "./sdk.js?v=0.3.6";
         // must render identically in a plain browser.
         if (hana && hana.state && typeof hana.state.get === "function") {
           const value = await hana.state.get(key);
-          return value === undefined || value === null ? fallback : value;
+          const out = value === undefined || value === null ? fallback : value;
+          stateDebug.lastGet = { key, stored: out === fallback ? "miss" : String(out) };
+          return out;
         }
-      } catch {
-        /* fall through to the fallback */
+      } catch (error) {
+        stateDebug.errors += 1;
+        stateDebug.lastGet = { key, stored: "error:" + String(error && error.message ? error.message : error).slice(0, 60) };
       }
       return fallback;
     },
     async set(key, value) {
+      stateDebug.sets += 1;
       try {
         if (hana && hana.state && typeof hana.state.set === "function") {
           await hana.state.set(key, value);
+          stateDebug.lastGet = { key, stored: "written:" + String(value) };
+        } else {
+          stateDebug.errors += 1;
+          stateDebug.lastGet = { key, stored: "no-state-face" };
         }
-      } catch {
+      } catch (error) {
+        stateDebug.errors += 1;
+        stateDebug.lastGet = { key, stored: "set-error:" + String(error && error.message ? error.message : error).slice(0, 60) };
         /* view state is a convenience; losing it must not break the card */
       }
     },
@@ -281,6 +293,10 @@ import { hana } from "./sdk.js?v=0.3.6";
     // normal case); stated when the bare-fetch fallback took over, because that is
     // the condition BUG-3 proved is not credential-safe in a current host.
     const counters = transport.counters;
+    lines.appendChild(el("div", "pc-timestamp",
+      "视图状态桥：读 " + stateDebug.gets + " · 写 " + stateDebug.sets + " · 错 " + stateDebug.errors +
+      " · 末次：" + (stateDebug.lastGet ? (stateDebug.lastGet.key + "=" + stateDebug.lastGet.stored) : "无")
+    ));
     if (counters.fallbacks > 0) {
       lines.appendChild(el("div", "pc-timestamp", "注意：本次使用了回退通道（无 hana.api.fetch），可能缺少卡片凭据。"));
     }
