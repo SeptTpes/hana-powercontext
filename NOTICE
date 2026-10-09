@@ -1,0 +1,34 @@
+hana-powercontext
+Copyright 2026 hana-powercontext contributors
+
+This product includes software developed as part of the hana-powercontext
+project (https://github.com/[owner]/hana-powercontext).
+
+This product integrates with, and depends on at runtime, the following
+third-party software:
+
+* PowerContext
+  Copyright OceanBase (https://github.com/oceanbase/powercontext)
+  Licensed under the Apache License, Version 2.0.
+  hana-powercontext is an independent HanaAgent (openhanako) integration for
+  PowerContext. It communicates with a separately-installed PowerContext
+  Server over HTTP and contains no PowerContext source code.
+
+* Reference implementation acknowledgement
+  The integration contract (pre-step recall, pc_* tool semantics, fail-open
+  behaviour) follows the official PowerContext DSH integration
+  (upstream `integrations/dsh`), vendored during development as
+  `artifacts/upstream-dsh-index.js` for contract verification only.
+
+* HanaAgent / openhanako
+  The host platform this App targets (https://github.com/liliMozi/openhanako),
+  whose App SDK and documentation define the v2 App contract. hana-powercontext
+  contains no openhanako source code.
+
+THE APP BUNDLE (`ui/assets/sdk.js`) IS THE UNMODIFIED BROWSER BUILD OF THE
+OFFICIAL Hana App SDK (`@hana/app-sdk`, `package/dist/ui.js` from
+`hana-app-sdk.tgz`), distributed verbatim as provided by the Hana App Creator
+scaffold. It is licensed by its author under the Hana App SDK's own terms and
+is not modified by this project (third-party notices and legal metadata are
+carried by the scaffold output: `app-ui.js.LEGAL.txt`,
+`THIRD_PARTY_NOTICES.txt`).
