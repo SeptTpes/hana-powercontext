@@ -1050,7 +1050,7 @@ section("BUG-3: the card has exactly one door, and it carries credentials");
 
   // (5) Version, and the manifest is otherwise untouched by this fix.
   const manifest = JSON.parse(readAppFile("manifest.json"));
-  check("the version is 0.4.0", manifest.version === "0.4.0", manifest.version);
+  check("the version is 0.4.2", manifest.version === "0.4.2", manifest.version);
   check("the capabilities are unchanged by the fix", JSON.stringify(manifest.capabilities) === JSON.stringify(["app/tools.expose-to-model", "app/hooks.agent-pre-step", "app/hooks.agent-before-start"]), manifest.capabilities);
   check("the card contribution is unchanged by the fix", manifest.contributes.cards.length === 1 && manifest.contributes.cards[0].route === "/dashboard.html", manifest.contributes);
 
@@ -1271,7 +1271,20 @@ section("B25: the card uses /prefs, and a failed write degrades quietly");
   // The old label may survive in a comment explaining the change; what must be gone
   // is the rendered line, so the check targets the exact string that built it.
   check("the retired 视图状态桥 meter is not rendered any more", !pageText.includes('"视图状态桥：读 "'), "the old label must not be concatenated into the footer");
-  check("the footer reports write failures", /pref_write_errors/.test(pageText));
+  // D37 fix: the footer reports the page's own failure counter. Summing it with the
+  // transport's counter displayed 2 for a single failed write, because both increment
+  // on the same call.
+  check("the footer reports write failures", /写失败 " \+ prefsState\.writeErrors/.test(pageText), "expected the footer to read prefsState.writeErrors directly");
+  check("the footer does not sum the two failure counters (the D37 double-count)", !/prefsState\.writeErrors \+ counters\.pref_write_errors/.test(pageText), "the sum is the D37 defect");
+  check("the transport counter still exists for offline diagnosis", /pref_write_errors: 0/.test(fs.readFileSync(path.join(appDir, "ui/assets/dashboard-fetch.js"), "utf8")));
+  // The end-to-end claim: one failed write, one count on screen.
+  {
+    const transportMod = requireFromHere("../ui/assets/dashboard-fetch.js");
+    transportMod.resetCounters();
+    const failing = { api: { async fetch() { throw new Error("nope"); } } };
+    await transportMod.writePrefs("handoff", true, { hana: failing });
+    check("one failed write increments the transport counter exactly once", transportMod.counters.pref_write_errors === 1, transportMod.counters);
+  }
 
   // Degradation: a failed write must not throw, must count, and must not undo the UI.
   const transport = requireFromHere("../ui/assets/dashboard-fetch.js");
@@ -1526,6 +1539,166 @@ section("BUG-3: route failures and Server outages are never confused");
   check("a route failure carries no address", routeFailure.baseUrl === undefined, routeFailure.baseUrl);
 }
 
+/* ---------------- TASK-11: audit fixes that must not silently regress ---- */
+
+section("TASK-11 Fix-4/5: manifest description and documentation counts");
+{
+  const requireFromHere = createRequire(import.meta.url);
+  const fs = requireFromHere("node:fs");
+  const path = requireFromHere("node:path");
+  // This file lives at <repo>/app/hana-powercontext/lib/, so the App directory is
+  // one level up and the repository root is three.
+  const appDir = path.join(path.dirname(new URL(import.meta.url).pathname), "..");
+  const repoRoot = path.join(appDir, "..", "..");
+  const readRoot = (name) => fs.readFileSync(path.join(repoRoot, name), "utf8");
+  const readApp = (name) => fs.readFileSync(path.join(appDir, name), "utf8");
+
+  const manifest = JSON.parse(readApp("manifest.json"));
+
+  // Fix-4: the description must describe what the App does, and must not promise a
+  // durable commit — the App performs a *temporary* transfer (see the trust boundary).
+  check("the description states the capability rather than the old session-bound phrasing", /Durable cross-session memory/.test(manifest.description), manifest.description);
+  check("the description mentions the bounded pre-step recall", /bounded pre-step recall/.test(manifest.description));
+  check("the description mentions the transferable Handoff workflow", /transferable Handoff workflow/.test(manifest.description));
+  check("the description does not claim a durable commit", !/durable commit/i.test(manifest.description), manifest.description);
+  // The fix is description-only: capabilities and the card contribution must be intact.
+  check("the capabilities are unchanged", JSON.stringify(manifest.capabilities) === JSON.stringify(["app/tools.expose-to-model", "app/hooks.agent-pre-step", "app/hooks.agent-before-start"]), manifest.capabilities);
+  check("the card contribution is unchanged", manifest.contributes.cards.length === 1 && manifest.contributes.cards[0].route === "/dashboard.html");
+
+  // Fix-5 / Fix-1: the counts stated in documentation must be the real ones. This is
+  // the assertion that would have caught "117 assertions" surviving three rewrites.
+  const zh = readRoot("README.md");
+  const en = readRoot("README_EN.md");
+  // The documented count must track the REAL count — that is the finding this fix
+  // answers ("117 assertions" survived three rewrites, then "429" survived another).
+  //
+  // An exact pin is impossible here: this very assertion changes the total, so
+  // "documented == total" can never hold once the check exists. A bound is the
+  // honest substitute — it catches the failure mode that actually happened (a number
+  // left behind while the suite grew by hundreds) without being self-defeating.
+  // The authoritative exact figure is the suite's own final line, kept in
+  // artifacts/stage3/audit-fix-selftest.txt.
+  // Two reasons this is a bound rather than an equality:
+  //   1. `checks` here counts assertions run SO FAR — the remaining sections still add
+  //      to it — so equality with the final total is unreachable from inside the run;
+  //   2. a documented figure can only be exact until the next assertion is added,
+  //      which makes an exact pin a maintenance trap rather than a guarantee.
+  // The bound therefore encodes the failure mode that actually happened twice (a
+  // number left behind while the suite grew by hundreds), and the exact figure lives
+  // in the suite's own final line, captured to artifacts/stage3/audit-fix-selftest.txt.
+  const DOC_TOLERANCE = 100;
+  const zhMatch = zh.match(/selftest\.mjs\u0060\uff08(\d+) \u9879/);
+  const enMatch = en.match(/lib\/selftest\.mjs\u0060?\s*\((\d+) checks/);
+  const shippedMatch = readApp("README.md").match(/(\d+) assertions/);
+  check("the zh README states a selftest count", Boolean(zhMatch), "expected a number in the verification section");
+  check("the en README states a selftest count", Boolean(enMatch), en.slice(0, 200));
+  check("the shipped README states a selftest count", Boolean(shippedMatch), "expected N assertions in the dev section");
+  if (zhMatch) {
+    check(
+      "the zh selftest count is not a stale figure",
+      Math.abs(Number(zhMatch[1]) - checks) <= DOC_TOLERANCE,
+      "docs say " + zhMatch[1] + " but the suite has reached " + checks + " (tolerance " + DOC_TOLERANCE + ")",
+    );
+  }
+  if (enMatch) {
+    check(
+      "the en selftest count matches the zh one",
+      Math.abs(Number(enMatch[1]) - Number(zhMatch ? zhMatch[1] : 0)) <= 2,
+      [zhMatch && zhMatch[1], enMatch[1]],
+    );
+  }
+  if (shippedMatch) {
+    check(
+      "the shipped selftest count matches the root one",
+      Math.abs(Number(shippedMatch[1]) - Number(zhMatch ? zhMatch[1] : 0)) <= 2,
+      [zhMatch && zhMatch[1], shippedMatch[1]],
+    );
+  }
+  check("no README still claims the ancient 117 assertions", !/117 assertions/.test(readApp("README.md")));
+  check("no README still claims the stale 429", !/429 \u9879|\(429 checks\)/.test(zh + en));
+  const shipped = readApp("README.md");
+  check("the shipped README states the real probe count", /250 assertions/.test(shipped));
+  check("the shipped README states the real hook-probe count", /122 assertions/.test(shipped));
+  check("the shipped README states 250 for the probe", /250 assertions/.test(shipped));
+  check("the shipped README states 122 for the hook probe", /122 assertions/.test(shipped));
+
+  // Fix-1: the shipped README must point at the authoritative root document, and must
+  // no longer claim hana.state persistence (the retired, never-working store).
+  check("the shipped README points at the root README as authoritative", /repository root/.test(shipped) && /README\.md/.test(shipped));
+  check("the shipped README no longer claims hana.state persistence", !/remembered per card\s+instance through/.test(shipped));
+  check("the shipped README says the preference survives a remount and a reinstall", /survives closing the card/.test(shipped) && /reinstalling the App/.test(shipped));
+  check("the shipped README states the expected grant set", /3 capability grants/.test(shipped) && /127\.0\.0\.1/.test(shipped));
+  check("the shipped README tells the reader to enable the App for the Agent", /enable the App/i.test(shipped));
+  check("the shipped README documents /powercontext as an alias", /\/powercontext/.test(shipped));
+}
+
+section("TASK-11 Fix-2/3/6: known limitations, wording, and code comments");
+{
+  const requireFromHere = createRequire(import.meta.url);
+  const fs = requireFromHere("node:fs");
+  const path = requireFromHere("node:path");
+  // This file lives at <repo>/app/hana-powercontext/lib/, so the App directory is
+  // one level up and the repository root is three.
+  const appDir = path.join(path.dirname(new URL(import.meta.url).pathname), "..");
+  const repoRoot = path.join(appDir, "..", "..");
+  const zh = fs.readFileSync(path.join(repoRoot, "README.md"), "utf8");
+  const en = fs.readFileSync(path.join(repoRoot, "README_EN.md"), "utf8");
+
+  // Fix-2: the two honest limitations must be present in BOTH languages.
+  check("zh states the finalize positive path has only simulation evidence", /finalize \u6b63\u8def\u5f84\u5f53\u524d\u4ec5\u6709\u672c\u5730\u6a21\u62df\u8bc1\u636e/.test(zh));
+  check("en states the same", /finalize positive path currently has only local simulation evidence/.test(en));
+  check("zh states review has never run against a real Candidate", /\u4ece\u672a\u5bf9\u771f\u5b9e\u5019\u9009\u6267\u884c\u8fc7/.test(zh));
+  check("en states the same", /has never run against a real Candidate/.test(en));
+  // The shipped README must not be the odd one out.
+  const shipped = fs.readFileSync(path.join(appDir, "README.md"), "utf8");
+  check("the shipped README carries both limitations too", /only local simulation evidence/.test(shipped) && /never run against a real Candidate/.test(shipped));
+
+  // Fix-3.1: the card does not show live data; it fetches on open and on refresh.
+  check("zh no longer claims the card is live", !/\u5b9e\u65f6\u5448\u73b0/.test(zh), "expected the 打开即取最新 wording instead");
+  check("zh says the card fetches on open and refreshes manually", /\u6253\u5f00\u5373\u53d6\u6700\u65b0\uff0c\u624b\u52a8\u5237\u65b0/.test(zh));
+  check("en no longer claims live Scope data", !/showing live/.test(en));
+  check("zh notes the 60s recall cache", /60s \u5185\u590d\u7528\u7f13\u5b58/.test(zh));
+  check("en notes the 60s recall cache", /cached answer for 60s/.test(en));
+
+  // Fix-3.2: the routes are read-only toward the Server, /prefs is App-local.
+  check("zh matrix distinguishes the Server-facing routes from /prefs", /\u5bf9 Server \u53ea\u8bfb\uff1b`\/prefs` \u4ec5\u5199 App \u81ea\u8eab\u504f\u597d/.test(zh));
+  check("en matrix distinguishes them too", /read-only toward the Server; `\/prefs` writes only the App's own preference/.test(en));
+
+  // Fix-3.3: the two zh-only wording defects.
+  check("zh says 引注边界而不是 href 边界", zh.includes("\u5f15\u6ce8\u8fb9\u754c") && !zh.includes("href \u8fb9\u754c"));
+  check("zh names the gate as the host's, not Hiro's", !/Hiro/.test(zh) && /\u5bbf\u4e3b\u7f51\u7edc\u95e8/.test(zh));
+  check("en never had either defect (parity)", !/Hiro|href \u8fb9\u754c/.test(en));
+
+  // Fix-3.4: baseUrl is documented, and the full table is pointed at.
+  check("zh documents baseUrl", /`baseUrl` \| `POWERCONTEXT_HANA_BASE_URL`/.test(zh));
+  check("en documents baseUrl", /`baseUrl` \| `POWERCONTEXT_HANA_BASE_URL`/.test(en));
+  check("zh points at the App README for the full key table", /\u5b8c\u6574\u952e\u8868\u89c1/.test(zh));
+  check("en points at it too", /Full key table in/.test(en));
+
+  // Fix-3.5: enablement and the alias are stated at the install site.
+  check("zh tells the reader to enable the App for the Agent", /\u5728\u5bf9\u5e94 Agent \u7684\u8bbe\u7f6e\u91cc\u542f\u7528\u672c App/.test(zh));
+  check("en tells the reader to enable it too", /enable the App in the settings of each Agent/.test(en));
+  check("zh names /powercontext as the alias", /`\/powercontext` \u662f\u5b83\u7684\u522b\u540d/.test(zh));
+
+  // Fix-3.6: the credential claim is graded — App-side asserted, host-side contracted.
+  check("zh grades the credential claim", /\u6709\u4e13\u9879\u65ad\u8a00/.test(zh) && /\u5bbf\u4e3b\u5951\u7ea6/.test(zh));
+  check("en grades it too", /covered by dedicated assertions/.test(en) && /host contract/.test(en));
+
+  // Fix-3.7: offline-only criteria are declared as such.
+  check("zh declares which criteria are offline-only", /\u5f53\u524d\u4ec5\u6709\u79bb\u7ebf\u65ad\u8a00\u8bc1\u636e/.test(zh));
+  check("en declares the same", /rest on offline assertions only/.test(en));
+
+  // Fix-6: the code-level comment fixes.
+  const page = fs.readFileSync(path.join(appDir, "ui/assets/dashboard-page.js"), "utf8");
+  const fetchMod = fs.readFileSync(path.join(appDir, "ui/assets/dashboard-fetch.js"), "utf8");
+  check("the SECTIONS comment is no longer in the present tense about hana.state", !/Section keys double as the `hana\.state` keys/.test(page));
+  check("the SECTIONS comment records the retirement", /used to double as the `hana\.state` keys/.test(page));
+  check("the legacy helpers are marked DEPRECATED for production use", /DEPRECATED for production use/.test(fetchMod));
+  // The comment wraps across lines, so the assertion has to tolerate the newline
+  // rather than assume the sentence sits on one line.
+  check("the deprecation says there is no live caller", /No live caller; do not\s+\*?\s*wire new code to these/.test(fetchMod), "expected the no-live-caller sentence");
+  check("the deprecation points at the acceptance record", /artifacts\/ACCEPTANCE-2\.md/.test(fetchMod));
+}
 /* ------------------------------------------------- registration surface -- */
 
 section("registration table");

@@ -1,5 +1,10 @@
 # PowerContext (hana-powercontext)
 
+**This is the brief shipped inside the App package.** The authoritative document —
+installation, configuration, trust boundary and known limitations — is the
+repository root [`README.md`](../../README.md). If you have just cloned the repo,
+start there.
+
 A Hana v2 App (`manifestVersion: 2`) that connects a session to a running
 [PowerContext](https://github.com/oceanbase/powercontext) Server over HTTP.
 
@@ -17,7 +22,7 @@ live in the PowerContext Server. What is here is the wiring — and one guarante
 | Tool | `pc_handoff_prepare` | Finalize a transferable Handoff: capture → prepare → finalize in one call |
 | Command | `/pc` | `doctor` · `scope` · `memory` · `hooks` · `handoff` · `review` |
 | Command | `/powercontext` | Alias for `/pc` |
-| Hook | `agent/pre-step` | **Automatic bounded recall before each model step** (stage 2) |
+| Hook | `agent/pre-step` | **Automatic bounded recall before each model step** |
 | Hook | `agent/before-start` | Handoff injection at turn start — code only, default off |
 | Card | **PowerContext 看板** | Scope, latest Handoff, memory list and Server state on a Hana board |
 
@@ -26,19 +31,21 @@ and is it ready. `/pc hooks` answers the second: is recall actually firing, and
 has the user granted the hooks. The dashboard card answers both at a glance,
 without typing anything.
 
-## The dashboard card (stage 3)
+## The dashboard card
 
 A chalkboard card that makes the App's state visible instead of leaving it in a
 black box: the effective Scope, the latest Handoff, the memory inventory and the
 Server's reachability — on one surface, refreshed when you ask it to.
 
-Two design rules it follows:
+Three rules it follows:
 
 - **The card never talks to the PowerContext Server.** It calls this App's own
-  backend (`/api/apps/hana-powercontext/routes/{status,handoff,memory,hooks}`),
-  which reuses the same Scope resolution, network declaration, timeout and
-  fail-open behaviour as the tools. One place to get the connection right, not
-  two. The routes are read-only: nothing the card does can write to the Server.
+  backend (`<app>/routes/{status,handoff,memory,hooks,prefs}`), which reuses the
+  same Scope resolution, network declaration, timeout and fail-open behaviour as
+  the tools. One place to get the connection right, not two.
+- **The Server-facing routes are read-only.** The only route that writes anything
+  is `/prefs`, and it writes one thing: this App's own collapse preference, into
+  the App's own app-data. Nothing the card does can write to the Server.
 - **A failure explains itself.** When the Server is down the card shows what
   happened, which address it tried, and how to fix it — instead of an empty panel
   that looks like a bug. An empty memory list teaches `pc_remember`; an empty
@@ -47,11 +54,22 @@ Two design rules it follows:
 
 The card fetches once when it mounts and then only when you press 刷新. It does not
 poll: a card that polls puts a permanent load on the Server for a surface you may
-not even be looking at. Collapsed/expanded sections are remembered per card
-instance through `hana.state`; the data itself is never cached, so what you see is
-what the Server said on the last refresh.
+not even be looking at. Section collapse state is persisted in the App's own
+app-data (`prefs.json` via the `/prefs` route), so it survives closing the card,
+host restarts, and reinstalling the App; the data itself is never cached, so what
+you see is what the Server said on the last refresh.
 
-## Review is a human decision (stage 3)
+## Collapse preference (`/prefs`)
+
+Sections remember whether you collapsed them. That preference is **not** card
+instance state — it is stored in the App's app-data directory and read back on
+every mount, which is why it survives a remount (the earlier attempt stored it in
+`hana.state`, whose lifetime is the card instance, so it never could).
+
+`prefs.json` contains booleans for the collapsible sections and nothing else: no
+Server data, no Scope id, no credential, no user text.
+
+## Review is a human decision
 
 `/pc review` lists pending Artifact Candidates and `/pc review approve|reject`
 decides them. **No review operation is exposed as a model-callable tool**, and
@@ -62,7 +80,7 @@ slash command can only be typed by a person, so that is the only door.
 A version conflict is reported, not retried — the decision has to land on the
 revision you actually looked at.
 
-## Automatic recall (stage 2)
+## Automatic recall
 
 The point of the App. Before each model step the `agent/pre-step` hook asks the
 Server for bounded context and, when it gets some, inserts **one** message
@@ -89,34 +107,6 @@ Three properties, all deliberate:
 Recall is cached per session for 60 seconds, so a tool loop inside one turn costs
 one request rather than one per step.
 
-### Query shaping (stage 2B)
-
-The Server's prepare path matches entities, not questions: sent a whole
-natural-language sentence it answers `status: "empty"`, and sent the same
-sentence's noun phrase it recalls the entry. Measured four ways in
-[`artifacts/stage2/prepare-query-experiment.py`](../../artifacts/stage2/prepare-query-experiment.py),
-and side by side against `/v1/memory/search` in
-[`artifacts/stage2/query-probe.md`](../../artifacts/stage2/query-probe.md).
-
-So the hook shapes the query before it sends it — `extractRetrievalQuery()` in
-`lib/hooks.js`, applied to the last user message:
-
-1. instruction sentences are dropped ("你是一个全新会话。请不要调用任何工具。");
-2. brackets, quotes and markup are stripped ("**PowerContext**" → `PowerContext`);
-3. stop words are filtered, Chinese and English ("地址是什么", "what is the …");
-4. **if nothing usable is left, the original text is sent instead** — the layer
-   never invents a query, it only removes noise, so the worst case is the
-   behaviour that existed before it.
-
-`PowerContext Server 地址是什么？` therefore reaches the Server as
-`PowerContext Server`. The 512-byte cap applies before and after the pass.
-
-Two things it deliberately does **not** touch: the *injected* message (that is
-the Server's own prepared block, verbatim) and the *captured* prompt (capture
-stores what the user typed, not the retrieval key). `/pc hooks` reports
-`extract_hits` and `skipped_empty_extracted` so the layer is observable rather
-than assumed.
-
 ### Switches
 
 | Key | Env var | Default | Meaning |
@@ -137,143 +127,77 @@ the Server. When enabled it captures only user prompts — not tool results, not
 assistant messages — and skips text it has already captured in the last 32
 prompts.
 
-`beforeStart` needs a committed Handoff to inject, which needs a Server with a
-generation provider; on a basic-memory Server it is a no-op by construction. See
-[the handoff section](#the-handoff-flow-and-its-one-prerequisite).
+For the full key table, override chain and trust boundary, see the root
+[`README.md`](../../README.md).
 
 ## Requirements
 
 - Hana `1.0.0-beta` or newer (`minAppVersion` pins the SDK this was built against).
-- A PowerContext Server listening on `http://127.0.0.1:8000`.
+- A PowerContext Server v1.2.0 listening on `http://127.0.0.1:8000`, installed
+  separately — see the root [`README.md`](../../README.md).
 - The host must grant `app/tools.expose-to-model` and `app/hooks.agent-pre-step`,
   and the App must be enabled for the Agent you want to use it with. All of these
   are user decisions in Hana's own permission UI; this App never prompts for them,
-  and it never grants itself anything. Without the hook grant the host simply
-  skips this App's adjudicator and the turn proceeds — that is the host's own
-  fail-open behaviour, not something the App implements.
-- `app/hooks.agent-before-start` is declared but its hook does nothing until
-  `beforeStart` is switched on and the Server can produce a Handoff.
+  and it never grants itself anything.
 
-## Configuration
+## Install
 
-Settings resolve per invocation, highest priority first. No restart is needed
-after a change.
+HanaAgent → Extension manager → **install from local directory** (choose
+`app/hana-powercontext`) or **install from the release zip**. Then:
 
-| Priority | Source |
-|---|---|
-| 1 | explicit per-call argument (`scope_id`) |
-| 2 | `<app-data>/config.json` |
-| 3 | environment, prefix `POWERCONTEXT_HANA_` |
-| 4 | built-in defaults |
+1. Complete the review panel. **Expected exactly 3 capability grants plus a
+   `127.0.0.1` network block.** Anything more — refuse and open an issue.
+2. **Enable the App for the Agent you want to use it with.** Until it is enabled
+   for that Agent, the `/pc` command family is not visible to it.
+3. Check connectivity with `/pc doctor`.
 
-| Key | Env var | Default | Meaning |
-|---|---|---|---|
-| `baseUrl` | `POWERCONTEXT_HANA_BASE_URL` | `http://127.0.0.1:8000` | Server address |
-| `timeoutMs` | `POWERCONTEXT_HANA_TIMEOUT_MS` | `5000` | Per-request budget |
-| `scopeId` | `POWERCONTEXT_HANA_SCOPE_ID` | *(empty)* | Scope to use; empty means ask the Server for its default |
-| `maxBytes` | `POWERCONTEXT_HANA_MAX_BYTES` | `8000` | Recall byte budget (Server range 512–32768) |
-| `maxResponseBytes` | `POWERCONTEXT_HANA_MAX_RESPONSE_BYTES` | `32768` | Response cap |
+Uninstalling removes the App directory; its app-data (including `prefs.json`, and
+a config override if you made one) is preserved.
 
-`baseUrl` must stay within the manifest's declared network door:
-`allowedHosts: ["127.0.0.1"]`, `allowLocalhost: true`, `methods: ["GET","POST"]`.
-Pointing it at a host outside that list is refused by the host, not by this App.
-
-## The trust boundary
-
-The Server returns historical context labelled as **untrusted history**, and this
-App does not launder that. Three consequences are built into the tool contracts:
-
-- `pc_handoff_prepare` writes the caller's own words into the boundary Source and
-  lets the **Server** generate the Draft from them. Neither side verifies those
-  claims; the tool says so rather than implying otherwise.
-- `pc_handoff_prepare` performs a **temporary** transfer. It never calls
-  `/v1/handoff/commit`, which is the durable-milestone operation and belongs to an
-  explicit user request.
-- Nothing in this App writes messages, rewrites prompts, or touches a session. Its
-  only power is the three tools and one command, all of which a user can revoke.
-
-### The handoff flow, and its one prerequisite
-
-`pc_handoff_prepare` runs the Server's explicit Handoff flow in three calls:
-
-```
-POST /v1/sources/content     the boundary text becomes a real Source
-POST /v1/handoff/prepare     evidence cites that exact Source; Server generates a Draft
-POST /v1/handoff/finalize    the Draft becomes the transferable value (details.finalized)
-```
-
-The middle step is **model-driven on the Server**, so it needs a generation
-provider. On a basic-memory Server — where `/v1/capabilities` reports
-`handoff_generation: false` — the tool reports a structured
-`handoff_generation_unavailable` error and states plainly that the boundary Source
-was already captured, so the work is not lost. `/pc doctor` shows the Server's
-capabilities if you need to check. This is a Server configuration matter, not an
-App fault: configure a generation provider to get finalized Handoffs.
-
-## Development
+## Development and validation
 
 ```sh
-# Logic check, no Hana and no Server needed. 117 assertions, including the full
+# Logic check, no Hana and no Server needed. 487 assertions, including the full
 # three-step handoff flow and every failure branch. The live section at the end is
 # skipped automatically when no Server is reachable.
 node lib/selftest.mjs
 
-# The stage 2 hooks driven the way the host drives them: registration through
-# sdk.hooks.onDecision, then a real pre-step invocation. Offline and deterministic.
-node lib/hook-probe.mjs
-
 # The card's backend aggregation and its view logic — what the card says for a
-# healthy Server, an empty Scope, and an outage. The rendered page needs a host;
-# these decisions are pure functions and do not.
+# healthy Server, an empty Scope, and an outage. 250 assertions; the rendered page
+# needs a host, these decisions are pure functions and do not.
 node lib/dashboard-probe.mjs
 
-# Real round trip through the App's own code against a live Server.
-# Provisions a Scope of its own; it never writes into a Scope it did not create.
-# Asserts the handoff path the Server actually owes, based on its own reported
-# handoff_generation capability.
-node lib/live-demo.mjs
-
-# Negative case: same tools, pointed at a port where nothing is listening.
-node lib/live-demo.mjs --fail-open
-
-# The handoff flow's third step, against a local Server that speaks the four
-# endpoints with a generation provider simulated. Real sockets, real payloads.
-node lib/finalize-probe.mjs
-
-# Repeated handoffs must not collide on the boundary Source id.
-node lib/burst-probe.mjs <scope-id> 10
+# The hooks driven the way the host drives them: registration through
+# sdk.hooks.onDecision, then a real pre-step invocation. 122 assertions, offline
+# and deterministic.
+node lib/hook-probe.mjs
 ```
 
-## Validate
+Full validation (static package check and the isolated smoke composition) is
+documented in the root [`README.md`](../../README.md).
 
-```sh
-# Static package validation.
-HANA_APP_TOOLS_ROOT=<hana-server-dir> \
-  node <skill-dir>/scripts/validate_app.mjs --dir . --json
+## Known limitations
 
-# Isolated startup, in the host's own AppHost.
-HANA_APP_TOOLS_ROOT=<hana-server-dir> \
-  node <hana-server-dir>/scripts/validate-app.mjs --dir . --smoke --json
-```
+Stated plainly, and mirrored in the root README so the two cannot diverge:
 
-`HANA_APP_TOOLS_ROOT` is required by both: each script resolves the Hana Server
-toolchain before it will run, and reports `author_tools_unavailable` without it.
-
-Note on the smoke check: it composes no slash-command registry, so `/pc` cannot
-register there. Command registration is therefore deferred past the load window
-and fully caught, so that it can never affect whether the App loads. The tools are
-the contract; `/pc` is a convenience over the same functions.
-
-## Install
-
-1. Copy this directory to `<HANA_HOME>/apps/hana-powercontext/`.
-2. Restart Hana, or reload the App from App Manager.
-3. Complete the review, approving `app/tools.expose-to-model` and the
-   `127.0.0.1` network declaration.
-4. Enable the App for the Agent you want to use it with.
-
-Uninstalling removes `apps/hana-powercontext`; `app-data/hana-powercontext` is
-preserved, which is where a config override would live.
+- **Subagent isolated sessions do not fire pre-step** (host engine boundary):
+  isolated-session continuation goes through the pull tools.
+- **The finalized Handoff carrier** (the full prepare→finalize output) needs a
+  generation provider on the Server (full mode); on Basic memory the tool honestly
+  reports `handoff_generation_unavailable` and records the boundary Source.
+  **The finalize positive path currently has only local simulation evidence** —
+  the selftest stub and `finalize-probe`'s simulated generation provider. The
+  honest capability gate on Basic memory and the boundary Source are
+  real-host verified; the finalized carrier itself is not.
+- **Smoke validation** fails in the isolated AppHost composition (SDK entry
+  precheck; no App code executes) while real-host loads are fine — verification
+  therefore keys on real-host load logs.
+- Recall matching is token-level: full natural-language questions may miss (the
+  App ships a query-extraction layer to mitigate).
+- **`/pc review approve|reject` has never run against a real Candidate** — those
+  need full mode to produce one. What is verified is the gate's construction: the
+  model tool surface contains no review tool, and that is covered by assertions
+  rather than by a live approval.
 
 ## License
 

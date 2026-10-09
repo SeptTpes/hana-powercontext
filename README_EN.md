@@ -10,9 +10,9 @@
 
 When an agent session ends, its reasoning and state stay behind in that session. Starting over means re-explaining — for you and for the agent. HanaAgent has cross-session retrieval built in (pull-style: the agent must remember to look); this project adds the **push-style** half:
 
-- **Automatic recall before every model step**: an `agent/pre-step` hook asks the PowerContext Server for bounded context and injects it, wrapped in an explicit `[PowerContext recall · untrusted_history]` fence — a brand-new session knows what was remembered before **its first sentence**, with no ceremony.
+- **Automatic recall before every model step**: an `agent/pre-step` hook asks the PowerContext Server for bounded context (reusing a cached answer for 60s) and injects it, wrapped in an explicit `[PowerContext recall · untrusted_history]` fence — a brand-new session knows what was remembered before **its first sentence**, with no ceremony.
 - **Pull-style tools**: `pc_remember` / `pc_memory_list` / `pc_handoff_prepare` cover explicit memory and handoffs.
-- **Handoff dashboard**: a chalkboard card showing live Scope, latest Handoff, memory inventory, Server status and hook counters.
+- **Handoff dashboard**: a chalkboard card that fetches the current Scope, latest Handoff, memory inventory, Server status and hook counters when you open it and when you refresh — it does not poll.
 
 All recalled content is forcibly wrapped as `untrusted_history` (data, not instructions); current user / repository / system instructions always take precedence.
 
@@ -24,7 +24,7 @@ All recalled content is forcibly wrapped as `untrusted_history` (data, not instr
 | Cross-session push recall | `agent/pre-step` hook + query extraction layer | ✅ verified (desktop & Bridge sessions) |
 | Subagent isolated sessions | pre-step does not fire (engine-level boundary); pull tools cover it | tested & recorded |
 | Work Handoff | capture → prepare → finalize explicit flow | ✅ (finalized carrier needs full mode, see below) |
-| Dashboard card | `contributes.cards` + read-only backend routes | ✅ |
+| Dashboard card | `contributes.cards` + backend routes (read-only toward the Server; `/prefs` writes only the App's own preference) | ✅ |
 | Prompt capture as Source | `POWERCONTEXT_HANA_CAPTURE_PROMPTS`, **off by default** | opt-in |
 | Review gate | `/pc review` — human-only; no review tools on the model surface | ✅ |
 
@@ -55,7 +55,9 @@ git clone https://github.com/[owner]/hana-powercontext.git
 cd hana-powercontext
 ```
 
-HanaAgent → Extension manager → install from local directory → select `app/hana-powercontext` → review the panel (expect exactly 3 capability grants + a 127.0.0.1 network block; anything more — refuse and open an issue).
+HanaAgent → Extension manager → install from local directory (or from the release zip) → select `app/hana-powercontext` → review the panel (expect exactly 3 capability grants + a 127.0.0.1 network block; anything more — refuse and open an issue).
+
+> After installing, **enable the App in the settings of each Agent you want to use it with** — until then the `/pc` command family is not visible to that Agent. The command entry point is `/pc`; `/powercontext` is its alias.
 
 ### 3. Verify in three steps
 
@@ -77,8 +79,9 @@ HanaAgent → Extension manager → install from local directory → select `app
 | `capturePrompts` | `…_CAPTURE_PROMPTS` | `false` | capture user prompts as Sources (writes prompts to the Server; off by default) |
 | `captureMaxBytes` | `…_CAPTURE_MAX_BYTES` | `4096` | per-capture cap |
 | `beforeStart` | `…_BEFORE_START` | `false` | inject latest Handoff at session start (needs full mode) |
+| `baseUrl` | `POWERCONTEXT_HANA_BASE_URL` | `http://127.0.0.1:8000` | Server address (change this if the port is taken) |
 
-Slash commands: `/pc doctor` (connectivity & readiness) · `/pc scope` · `/pc memory` · `/pc handoff` · `/pc hooks` (injection counters & grant ledger) · `/pc review` (human gate).
+Slash commands: `/pc doctor` (connectivity & readiness) · `/pc scope` · `/pc memory` · `/pc handoff` · `/pc hooks` (injection counters & grant ledger) · `/pc review` (human gate). Full key table in [`app/hana-powercontext/README.md`](app/hana-powercontext/README.md).
 
 ## Architecture, one picture
 
@@ -96,7 +99,7 @@ Slash commands: `/pc doctor` (connectivity & readiness) · `/pc scope` · `/pc m
                                         DSH official integrations share the Server
 ```
 
-Design invariants: **fail-open** (Server down → no injection / tools answer with clear errors; the session proceeds); **credential minimisation** (the App never sets credential headers itself; the route proxy strips inbound credential material); **privacy off by default** (prompt capture is opt-in); **citation boundary** (recalled history is always quarantined data, never dressed as instructions).
+Design invariants: **fail-open** (Server down → no injection / tools answer with clear errors; the session proceeds); **credential minimisation** (the App never sets credential headers itself — covered by dedicated assertions; stripping inbound credential material is the host route proxy's job, a host contract documented in HanaAgent's APPS.md); **privacy off by default** (prompt capture is opt-in); **citation boundary** (recalled history is always quarantined data, never dressed as instructions).
 
 ## Known limitations (stated plainly)
 
@@ -104,10 +107,12 @@ Design invariants: **fail-open** (Server down → no injection / tools answer wi
 - **The finalized Handoff carrier** (the full prepare→finalize output) needs a generation provider on the Server (full mode); on Basic memory the tool honestly reports `handoff_generation_unavailable` and records the boundary Source.
 - **Smoke validation** fails in the isolated AppHost composition (SDK entry precheck; no App code executes) while real-host loads are fine — verification therefore keys on real-host load logs.
 - Recall matching is token-level: full natural-language questions may miss (the App ships a query-extraction layer to mitigate).
+- **The finalize positive path currently has only local simulation evidence** (the selftest stub plus `finalize-probe`'s simulated generation provider). The honest capability gate on Basic memory and the boundary Source are real-host verified.
+- **`/pc review approve|reject` has never run against a real Candidate** (those need full mode to produce one). What is verified is the gate's construction — no review tool on the model surface — and that rests on code and assertions.
 
 ## Verification system
 
-This repo treats acceptance as a first-class artifact: `lib/selftest.mjs` (429 checks) / `lib/dashboard-probe.mjs` (250) / `lib/hook-probe.mjs` (122) / `lib/live-demo.mjs` (end-to-end against a real Server) / `scripts/verify-fail-open.sh` (degradation semantics). The fix history is fully documented under `artifacts/` (acceptance records and deviation logs), including reproducible defect reports for the host platform and the upstream project.
+This repo treats acceptance as a first-class artifact: `lib/selftest.mjs` (487 checks, including the live section) / `lib/dashboard-probe.mjs` (250) / `lib/hook-probe.mjs` (122) / `lib/live-demo.mjs` (end-to-end against a real Server) / `scripts/verify-fail-open.sh` (degradation semantics). Some acceptance criteria (the capture-enabled side, the kill-switch, the real-host outage hook path) currently rest on offline assertions only; the on-hardware steps live in the `artifacts/` acceptance records. The fix history is fully documented under `artifacts/` (acceptance records and deviation logs), including reproducible defect reports for the host platform and the upstream project.
 
 ## License
 

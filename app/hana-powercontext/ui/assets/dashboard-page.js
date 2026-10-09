@@ -40,7 +40,7 @@
 // <script src>, but it is still an asset the host may cache, and a stale bridge
 // reintroduces BUG-4 — hana.* silently missing. Keep this query equal to
 // manifest.json's version; lib/selftest.mjs asserts both against the manifest.
-import { hana } from "./sdk.js?v=0.4.0";
+import { hana } from "./sdk.js?v=0.4.2";
 
 (function main() {
   "use strict";
@@ -66,7 +66,13 @@ import { hana } from "./sdk.js?v=0.4.0";
    */
   const routesBase = transport.routesBaseFrom(typeof location === "object" ? location.pathname : "");
 
-  /** Section keys double as the `hana.state` keys for collapse state. */
+  /**
+   * The collapsible sections.
+   *
+   * These keys used to double as the `hana.state` keys for collapse state; since
+   * 0.4.0 the preference is persisted in the App's own app-data instead, keyed by
+   * these same names in `prefs.json`.
+   */
   const SECTIONS = ["handoff", "memory"];
 
   const state = {
@@ -312,9 +318,15 @@ import { hana } from "./sdk.js?v=0.4.0";
     // persistence that does: app-data preferences, read at boot and written on each
     // toggle. The raw envelope line is dropped; the counts are the useful part, and
     // the value here is a preference, not a diagnostic puzzle.
+    // D37 fix: one failure, one count. `savePref` already records every failure it
+    // sees, and `transport.counters.pref_write_errors` increments on exactly those
+    // same calls — so summing the two displayed 2 for a single failed write. The
+    // page counter is the one that is always populated on this path (it also covers
+    // failures that never reach the transport), so it is the one shown; the
+    // transport counter stays in the counter set for offline diagnosis.
     lines.appendChild(el("div", "pc-timestamp",
       "折叠偏好（app-data 持久）：读 " + prefsState.reads + " · 写 " + prefsState.writes +
-      " · 写失败 " + (prefsState.writeErrors + counters.pref_write_errors) +
+      " · 写失败 " + prefsState.writeErrors +
       " · 末次 " + prefsState.last
     ));
     if (counters.fallbacks > 0) {

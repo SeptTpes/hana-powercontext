@@ -277,12 +277,18 @@
   /**
    * The collapse state, read and written through whatever bridge is supplied.
    *
-   * B18 asked whether a collapsed section survives a remount. That question is
-   * about *this* persistence, not about the DOM, so it lives here where it can be
-   * unit-tested: the probe supplies a fake bridge, collapses something, builds a
-   * second reader over the same store, and asserts the state came back. What stays
-   * unproven offline is only whether the host's `hana.state` is the thing behind
-   * the bridge (that is B18-on-real-hardware).
+   * DEPRECATED for production use — kept as the record of the pre-0.4.0
+   * `hana.state` approach (see `artifacts/ACCEPTANCE-2.md`). No live caller; do not
+   * wire new code to these. The card persists its collapse preference through
+   * `readPrefs`/`writePrefs` against the App's own app-data.
+   *
+   * Why it is still here, and still tested: B18 asked whether a collapsed section
+   * survives a remount, and this is the code that answered "no, and here is why".
+   * The probe supplies a fake bridge, collapses something, builds a second reader
+   * over the same store, and asserts the state came back — which pins the
+   * *mechanism* while the real defect was the store's lifetime
+   * (`hana.state` lives as long as the card instance). Deleting a tested function
+   * is how the evidence for a past decision disappears.
    *
    * A `null` read means "never written", which must stay distinct from an explicit
    * `false` — otherwise a section the user expanded on purpose would be
