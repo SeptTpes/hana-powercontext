@@ -25,7 +25,7 @@ Agent 的工作会话结束后，推理与状态留在会话里。开新会话�
 | subagent 隔离会话 | 不触发 pre-step（引擎级边界），走拉式工具互补 | 实测记录 |
 | 工作交接（Handoff） | capture → prepare → finalize 显式交接流 | ✅（finalized 载体需 full 模式，见下） |
 | 看板卡 | `contributes.cards` + 后端路由（对 Server 只读；`/prefs` 仅写 App 自身偏好） | ✅ |
-| 输入捕获为 Source | `POWERCONTEXT_HANA_CAPTURE_PROMPTS`，**默认关** | 显式开启后生效 |
+| 输入捕获为 Source | `POWERCONTEXT_HANA_CAPTURE_PROMPTS`，**默认关** | 显式开启后生效；**捕获独立于召回结果**——有新用户文本的步骤都会捕获，Server 不可达时跳过 |
 | 审阅门禁 | `/pc review` 仅人手触发，模型工具面零审阅工具 | ✅ |
 
 ## 环境要求
@@ -104,13 +104,14 @@ HanaAgent → 扩展管理 → 从本地目录安装（或从发布 zip 安装�
 - **subagent 隔离会话不触发 pre-step**（宿主引擎级边界）：隔离会话的记忆接续走拉式工具；
 - **完整 Handoff 载体**（prepare→finalize 的 finalized 输出）需 Server 配置生成 provider（full 模式）；Basic memory 下该工具诚实报 `handoff_generation_unavailable` 并落库边界 Source；
 - **smoke 校验**在隔离 AppHost 组合下失败（SDK 入口前置校验，App 代码未执行），真机加载正常——验证以真宿主加载日志为准；
+- **召回注入是每步临时注入、不写入会话记录**——由宿主每步重放，因此复盘会话时看不到当时的召回内容；
 - 召回检索为词项级：完整自然语言长句可能不命中（App 内置 query 提炼层缓解）；
 - **full 模式下的 finalize 正路径当前仅有本地模拟证据**（selftest 桩 + `finalize-probe` 模拟生成 provider）；Basic memory 下的诚实能力门与边界 Source 为真机验证；
 - **`/pc review approve|reject` 从未对真实候选执行过**（候选需 full 模式产生）；已验证的是门禁的构造保证——模型工具面零审阅工具，且该保证以代码与断言为准。
 
 ## 验证体系
 
-本仓库把验收当一等公民：`lib/selftest.mjs`（487 项，含 live 段）/ `lib/dashboard-probe.mjs`（250 项）/ `lib/hook-probe.mjs`（122 项）/ `lib/live-demo.mjs`（真 Server 端到端）/ `scripts/verify-fail-open.sh`（降级语义）。部分验收判据（捕获开启侧 / kill-switch / 真机停机钩子路径）当前仅有离线断言证据，真机执行步骤见 `artifacts/` 验收记录。修复过程全程留痕（`artifacts/` 下验收记录与偏差清单），包括对宿主与上游的可复现缺陷报告。
+本仓库把验收当一等公民：`lib/selftest.mjs`（513 项，含 live 段）/ `lib/dashboard-probe.mjs`（250 项）/ `lib/hook-probe.mjs`（131 项）/ `lib/live-demo.mjs`（真 Server 端到端）/ `scripts/verify-fail-open.sh`（降级语义）。部分验收判据（捕获开启侧 / kill-switch / 真机停机钩子路径）当前仅有**离线断言证据**，尚未在真机上执行；离线复跑说明见 [`docs/VERIFICATION.md`](docs/VERIFICATION.md)。
 
 ## 许可
 

@@ -25,7 +25,7 @@ All recalled content is forcibly wrapped as `untrusted_history` (data, not instr
 | Subagent isolated sessions | pre-step does not fire (engine-level boundary); pull tools cover it | tested & recorded |
 | Work Handoff | capture → prepare → finalize explicit flow | ✅ (finalized carrier needs full mode, see below) |
 | Dashboard card | `contributes.cards` + backend routes (read-only toward the Server; `/prefs` writes only the App's own preference) | ✅ |
-| Prompt capture as Source | `POWERCONTEXT_HANA_CAPTURE_PROMPTS`, **off by default** | opt-in |
+| Prompt capture as Source | `POWERCONTEXT_HANA_CAPTURE_PROMPTS`, **off by default** | opt-in; **capture is independent of the recall result** — any step with new user text is captured, and it is skipped when the Server is unreachable |
 | Review gate | `/pc review` — human-only; no review tools on the model surface | ✅ |
 
 ## Requirements
@@ -106,13 +106,14 @@ Design invariants: **fail-open** (Server down → no injection / tools answer wi
 - **Subagent isolated sessions do not fire pre-step** (host engine boundary): isolated-session continuation goes through pull tools.
 - **The finalized Handoff carrier** (the full prepare→finalize output) needs a generation provider on the Server (full mode); on Basic memory the tool honestly reports `handoff_generation_unavailable` and records the boundary Source.
 - **Smoke validation** fails in the isolated AppHost composition (SDK entry precheck; no App code executes) while real-host loads are fine — verification therefore keys on real-host load logs.
+- **Recall injection is per-step and transient; it is not written to the session record.** The host replays it each step, which is why reviewing a past session will not show the recalled content.
 - Recall matching is token-level: full natural-language questions may miss (the App ships a query-extraction layer to mitigate).
 - **The finalize positive path currently has only local simulation evidence** (the selftest stub plus `finalize-probe`'s simulated generation provider). The honest capability gate on Basic memory and the boundary Source are real-host verified.
 - **`/pc review approve|reject` has never run against a real Candidate** (those need full mode to produce one). What is verified is the gate's construction — no review tool on the model surface — and that rests on code and assertions.
 
 ## Verification system
 
-This repo treats acceptance as a first-class artifact: `lib/selftest.mjs` (487 checks, including the live section) / `lib/dashboard-probe.mjs` (250) / `lib/hook-probe.mjs` (122) / `lib/live-demo.mjs` (end-to-end against a real Server) / `scripts/verify-fail-open.sh` (degradation semantics). Some acceptance criteria (the capture-enabled side, the kill-switch, the real-host outage hook path) currently rest on offline assertions only; the on-hardware steps live in the `artifacts/` acceptance records. The fix history is fully documented under `artifacts/` (acceptance records and deviation logs), including reproducible defect reports for the host platform and the upstream project.
+This repo treats acceptance as a first-class artifact: `lib/selftest.mjs` (513 checks, including the live section) / `lib/dashboard-probe.mjs` (250) / `lib/hook-probe.mjs` (131) / `lib/live-demo.mjs` (end-to-end against a real Server) / `scripts/verify-fail-open.sh` (degradation semantics). Some acceptance criteria (the capture-enabled side, the kill-switch, the real-host outage hook path) currently rest on **offline assertions only** and have not been exercised on real hardware; see [`docs/VERIFICATION.md`](docs/VERIFICATION.md) for how to re-run them offline.
 
 ## License
 

@@ -616,6 +616,26 @@ export async function commandReview(sdk, config, argsText) {
 
 /* --------------------------------------------------------------- commands -- */
 
+/**
+ * Name the configuration layers that actually contributed a value.
+
+ * `/pc doctor` used to render `verdict.configSource`, a field `probe()` has never
+ * returned — so the line silently never printed, and the one question the line exists
+ * to answer ("why is it using that Server?") went unanswered even after the config
+ * file layer was fixed. Rendering it from `config.sources`, which is right here, keeps
+ * the answer next to the settings it describes.
+ *
+ * Reported as "defaults" when nothing overrode anything, so the absence of a source is
+ * stated rather than left blank — a blank line reads as a bug.
+ */
+function describeConfigSources(config) {
+  const sources = (config && config.sources) || {};
+  const named = [];
+  if (sources.appData && Object.keys(sources.appData).length > 0) named.push("config.json");
+  if (sources.env && Object.keys(sources.env).length > 0) named.push("env");
+  if (sources.explicit && Object.keys(sources.explicit).length > 0) named.push("call args");
+  return named.length > 0 ? named.join(" + ") : "defaults";
+}
 function plural(count, singular) {
   return `${count} ${singular}${count === 1 ? "" : "s"}`;
 }
@@ -640,7 +660,7 @@ export async function commandDoctor(sdk, config, probeFn) {
   }
   lines.push("");
   lines.push(`response cap: ${config.maxResponseBytes} bytes | request timeout: ${config.timeoutMs} ms`);
-  if (verdict.configSource) lines.push(`config from: ${verdict.configSource}`);
+  lines.push(`config from: ${describeConfigSources(config)}`);
   if (!verdict.capabilities) {
     lines.push("");
     lines.push("capabilities probe failed (Server is still usable):");

@@ -455,6 +455,72 @@ section("pre-step: input capture");
     {},
   );
   check("a throwing capture path is survivable", throwingDecision === undefined || Boolean(throwingDecision));
+
+  /* ---------------- F2: capture must not depend on the recall matching --------
+   * Before this fix the capture block sat after the `recall.empty` early return, so
+   * a step the Server had nothing for was never captured — precisely the steps most
+   * worth remembering (a first message, a new subject). These assertions pin the new
+   * ordering, including the case that motivated it.
+   */
+  const emptyRecall = (url) => {
+    if (url.endsWith("/v1/context/prepare")) return jsonResponse(200, { schema: "x", status: "empty", content: null, content_bytes: 0 });
+    if (url.endsWith("/v1/sources/content")) return jsonResponse(202, { status: "accepted", source: { name: "content", source_id: "pc-capture-e" }, position: 1 });
+    return jsonResponse(404, { error: { code: "unknown", message: "no stub", details: null } });
+  };
+
+  // (1) empty recall + capture on → the input IS captured, and nothing is injected.
+  {
+    const empty = await freshHarness(emptyRecall, { capturePrompts: true });
+    counters.captures = 0;
+    const decision = await empty.preStep({ messages: [{ role: "user", content: "a brand new subject" }], session: { sessionId: "f2a", sessionPath: "/tmp/f2a" } });
+    const captures = empty.calls.filter((c) => c.url.endsWith("/v1/sources/content"));
+    check("F2: an unmatched step still injects nothing", decision === undefined, decision);
+    check("F2: an unmatched step is still captured (exactly once)", captures.length === 1, empty.calls.map((c) => c.url));
+    check("F2: the capture counter advanced", counters.captures === 1, counters.captures);
+    check("F2: the captured text is the user's own words", captures[0].body.content === "a brand new subject", captures[0].body.content);
+    check("F2: the empty skip is still counted", counters.skipped_empty >= 1, counters.skipped_empty);
+  }
+
+  // (2) prepare failure → no capture attempted (a write to an unreachable Server).
+  {
+    const down = await freshHarness(
+      (url) => {
+        if (url.endsWith("/v1/context/prepare")) return jsonResponse(500, { error: { code: "internal_error", message: "prepare blew up", details: null } });
+        if (url.endsWith("/v1/sources/content")) return jsonResponse(202, { status: "accepted", source: { name: "content", source_id: "pc-capture-nope" }, position: 1 });
+        return jsonResponse(404, { error: { code: "unknown", message: "no stub", details: null } });
+      },
+      { capturePrompts: true },
+    );
+    let threw = null;
+    let decision = null;
+    try {
+      decision = await down.preStep({ messages: [{ role: "user", content: "server is sick" }], session: { sessionId: "f2b", sessionPath: "/tmp/f2b" } });
+    } catch (error) {
+      threw = error;
+    }
+    check("F2: a failed prepare does not throw", threw === null, threw && threw.message);
+    check("F2: a failed prepare injects nothing", decision === undefined, decision);
+    check("F2: a failed prepare attempts no capture", down.calls.filter((c) => c.url.endsWith("/v1/sources/content")).length === 0, down.calls.map((c) => c.url));
+  }
+
+  // (3) a pure tool-loop step (no new user text) still captures nothing, even with
+  //     capture on and a matching recall: there is no new input to record.
+  {
+    const toolLoop = await freshHarness(captureBehaviour, { capturePrompts: true });
+    // Prime the session so the follow-up step has a previous query but no new text.
+    await toolLoop.preStep({ messages: [{ role: "user", content: "first" }], session: { sessionId: "f2c", sessionPath: "/tmp/f2c" } });
+    const before = toolLoop.calls.filter((c) => c.url.endsWith("/v1/sources/content")).length;
+    await toolLoop.preStep({
+      messages: [
+        { role: "user", content: "first" },
+        { role: "assistant", content: null, toolCalls: [{ id: "t1", name: "x", arguments: {} }] },
+        { role: "toolResult", toolCallId: "t1", content: "ok" },
+      ],
+      session: { sessionId: "f2c", sessionPath: "/tmp/f2c" },
+    });
+    const after = toolLoop.calls.filter((c) => c.url.endsWith("/v1/sources/content")).length;
+    check("F2: a pure tool-loop step adds no capture", after === before, [before, after]);
+  }
 }
 
 /* ------------------------------------------------------------ switches --- */

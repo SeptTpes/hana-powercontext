@@ -265,9 +265,14 @@ export default defineApp(async (sdk) => {
 
   // Deliberately not awaited, and the promise is fully handled: whatever happens
   // here settles without reaching the App's load result.
-  setTimeout(() => {
+  const commandTimer = setTimeout(() => {
     registerCommands().catch(() => {});
   }, COMMAND_REGISTRATION_DELAY_MS);
+  // `unref` so this pending timer never keeps the AppHost child alive on its exit
+  // path. Without it the process lingers up to COMMAND_REGISTRATION_DELAY_MS after
+  // its work is done, which matters when several Apps load and unload together.
+  // `unref` exists on Node timers; guard in case a host shims setTimeout.
+  if (typeof commandTimer.unref === "function") commandTimer.unref();
 
   await sdk.logger.info(`hana-powercontext ready (${registered} tools registered)`);
 });

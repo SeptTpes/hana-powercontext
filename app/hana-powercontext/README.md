@@ -122,6 +122,11 @@ Boolean values accept `true/false`, `1/0`, `yes/no`, `on/off`; anything else is
 ignored rather than guessed, so a typo in a kill-switch cannot silently read as
 "off".
 
+Capture is **independent of whether recall matched**: any step carrying new user
+text is captured, including a first message or a subject the Server knows nothing
+about yet. It is skipped only when the Server is unreachable — capture is a write,
+and a write cannot succeed where the read just failed.
+
 `capturePrompts` is off by default because it writes the user's own prompts to
 the Server. When enabled it captures only user prompts — not tool results, not
 assistant messages — and skips text it has already captured in the last 32
@@ -157,7 +162,7 @@ a config override if you made one) is preserved.
 ## Development and validation
 
 ```sh
-# Logic check, no Hana and no Server needed. 487 assertions, including the full
+# Logic check, no Hana and no Server needed. 513 assertions, including the full
 # three-step handoff flow and every failure branch. The live section at the end is
 # skipped automatically when no Server is reachable.
 node lib/selftest.mjs
@@ -168,7 +173,7 @@ node lib/selftest.mjs
 node lib/dashboard-probe.mjs
 
 # The hooks driven the way the host drives them: registration through
-# sdk.hooks.onDecision, then a real pre-step invocation. 122 assertions, offline
+# sdk.hooks.onDecision, then a real pre-step invocation. 131 assertions, offline
 # and deterministic.
 node lib/hook-probe.mjs
 ```

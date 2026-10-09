@@ -12,6 +12,9 @@
  * there would freeze whatever the AppHost child happened to inherit.
  */
 
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
+
 export const ENV_PREFIX = "POWERCONTEXT_HANA_";
 
 export const DEFAULTS = Object.freeze({
@@ -97,10 +100,12 @@ export function readAppDataConfig(sdk) {
   const dir = sdk && typeof sdk.dataDir === "string" ? sdk.dataDir : null;
   if (!dir) return null;
   try {
-    // Lazy require: keeps module load free of filesystem work.
-    const fs = require("node:fs");
-    const path = require("node:path");
-    const raw = fs.readFileSync(path.join(dir, "config.json"), "utf8");
+    // Static imports, not a lazy `require`: this App is loaded as an ES module, and in
+    // ESM module scope `require` is not bound at all. The ReferenceError used to be
+    // swallowed by the catch below, so this entire layer silently returned null in a
+    // real host — no log, no error, and the config file never took effect. Found by an
+    // independent audit of 1.0.0.
+    const raw = readFileSync(join(dir, "config.json"), "utf8");
     const parsed = JSON.parse(raw);
     if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return null;
     const out = {};

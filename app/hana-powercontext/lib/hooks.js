@@ -41,9 +41,6 @@ const CACHE_MAX_ENTRIES = 64;
 /** How many recent prompts the capture deduplicator remembers. */
 export const CAPTURE_LRU_SIZE = 32;
 
-/** Wrapper cost allowance on top of the configured body budget. */
-export const WRAPPER_OVERHEAD_BYTES = 1024;
-
 /**
  * The explicit trust wrapper.
  *
@@ -80,7 +77,6 @@ export const counters = {
   extract_hits: 0,
   skipped_error: 0,
   skipped_no_query: 0,
-  skipped_oversize: 0,
   cache_hits: 0,
   cache_misses: 0,
   captures: 0,
@@ -506,6 +502,14 @@ export function lastQueryFor(sessionKey) {
  *     budget, the recall is truncated; the messages around it are never trimmed
  *     to make room. Dropping the user's own text to fit recall would be a
  *     strictly worse trade than shortening the recall.
+ *
+ * A note on the budget, because there used to be an unused constant implying
+ * otherwise: the wrapper costs a fixed **56 bytes** (42-byte prefix + 12-byte suffix
+ * + 2 newlines), and `maxBytes` bounds the *body* only. So an injected message can
+ * exceed the configured budget by those 56 bytes. That is deliberate rather than an
+ * oversight: the allowance is absorbed by the protocol headroom (the default 8192
+ * sits well under the Server's 32768 prepare cap), and reserving it separately would
+ * silently shrink every recall to pay for a wrapper the reader never asked about.
  */
 export function injectBeforeLastUser(messages, recallText, maxBytes) {
   const index = lastUserIndex(messages);
@@ -646,7 +650,6 @@ export async function preStepDecision(sdk, config, invocation, deps = {}) {
   const {
     prepareRecallFn = prepareRecall,
     capturePromptFn = capturePrompt,
-    now = () => Date.now(),
   } = deps;
 
   counters.prestep_invocations += 1;
@@ -721,13 +724,19 @@ export async function preStepDecision(sdk, config, invocation, deps = {}) {
     if (recall.unreachable) clearRecallCache();
     return undefined;
   }
-  if (recall.empty) {
-    counters.skipped_empty += 1;
-    return undefined;
-  }
-
-  // Capture is best-effort and strictly after a successful recall, so a capture
-  // problem can never be the reason a step lost its injection.
+  // Capture runs BEFORE the empty-recall return, and that ordering is the whole
+  // point: capture is about the user's input, not about whether the Server happened
+  // to match it. Tying it to a hit meant the steps most worth remembering — a first
+  // message, a new subject, anything the Server had nothing for yet — were precisely
+  // the steps that never got captured, which is the opposite of the intent.
+  //
+  // It sits AFTER the `!recall.ok` return above, because capture is a write: if the
+  // Server could not be reached for a read, it will not be reachable for a write
+  // either, and attempting it would only add a second failure to a step that is
+  // already degrading.
+  //
+  // It is best-effort either way. A capture problem can never be the reason a step
+  // lost its injection, so it is caught and counted, never propagated.
   //
   // It captures `rawQuery`, not the extracted phrase, and that is a deliberate
   // separation of the two consumers: the extractor exists so the *matcher* can
@@ -741,6 +750,12 @@ export async function preStepDecision(sdk, config, invocation, deps = {}) {
     } catch {
       counters.captures_failed += 1;
     }
+  }
+
+  if (recall.empty) {
+    // The step is still a successful no-op for recall; the input was captured.
+    counters.skipped_empty += 1;
+    return undefined;
   }
 
   return finishInjection(messages, recall, config, counters);

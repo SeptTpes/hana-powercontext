@@ -1050,7 +1050,7 @@ section("BUG-3: the card has exactly one door, and it carries credentials");
 
   // (5) Version, and the manifest is otherwise untouched by this fix.
   const manifest = JSON.parse(readAppFile("manifest.json"));
-  check("the version is 1.0.0", manifest.version === "1.0.0", manifest.version);
+  check("the version is 1.0.1", manifest.version === "1.0.1", manifest.version);
   check("the capabilities are unchanged by the fix", JSON.stringify(manifest.capabilities) === JSON.stringify(["app/tools.expose-to-model", "app/hooks.agent-pre-step", "app/hooks.agent-before-start"]), manifest.capabilities);
   check("the card contribution is unchanged by the fix", manifest.contributes.cards.length === 1 && manifest.contributes.cards[0].route === "/dashboard.html", manifest.contributes);
 
@@ -1617,10 +1617,10 @@ section("TASK-11 Fix-4/5: manifest description and documentation counts");
   check("no README still claims the ancient 117 assertions", !/117 assertions/.test(readApp("README.md")));
   check("no README still claims the stale 429", !/429 \u9879|\(429 checks\)/.test(zh + en));
   const shipped = readApp("README.md");
-  check("the shipped README states the real probe count", /250 assertions/.test(shipped));
-  check("the shipped README states the real hook-probe count", /122 assertions/.test(shipped));
-  check("the shipped README states 250 for the probe", /250 assertions/.test(shipped));
-  check("the shipped README states 122 for the hook probe", /122 assertions/.test(shipped));
+  // One assertion per suite. (An earlier pair asserted the same two numbers twice —
+  // harmless but redundant, and two places to update whenever a suite grows.)
+  check("the shipped README states the real dashboard-probe count", /\b250 assertions/.test(shipped), "expected 250 assertions");
+  check("the shipped README states the real hook-probe count", /\b131 assertions/.test(shipped), "expected 131 assertions");
 
   // Fix-1: the shipped README must point at the authoritative root document, and must
   // no longer claim hana.state persistence (the retired, never-working store).
@@ -1685,8 +1685,10 @@ section("TASK-11 Fix-2/3/6: known limitations, wording, and code comments");
   check("en grades it too", /covered by dedicated assertions/.test(en) && /host contract/.test(en));
 
   // Fix-3.7: offline-only criteria are declared as such.
-  check("zh declares which criteria are offline-only", /\u5f53\u524d\u4ec5\u6709\u79bb\u7ebf\u65ad\u8a00\u8bc1\u636e/.test(zh));
-  check("en declares the same", /rest on offline assertions only/.test(en));
+  // Formatting-agnostic on purpose: a stray emphasis marker around the phrase must not
+  // break the check, because what matters is the claim, not its typography.
+  check("zh declares which criteria are offline-only", /\u5f53\u524d\u4ec5\u6709[\s*]*(\u79bb\u7ebf\u65ad\u8a00\u8bc1\u636e)/.test(zh), "expected the offline-evidence claim");
+  check("en declares the same", /rest on[\s*]*(offline assertions only)/.test(en), "expected the offline-evidence claim");
 
   // Fix-6: the code-level comment fixes.
   const page = fs.readFileSync(path.join(appDir, "ui/assets/dashboard-page.js"), "utf8");
@@ -1698,6 +1700,164 @@ section("TASK-11 Fix-2/3/6: known limitations, wording, and code comments");
   // rather than assume the sentence sits on one line.
   check("the deprecation says there is no live caller", /No live caller; do not\s+\*?\s*wire new code to these/.test(fetchMod), "expected the no-live-caller sentence");
   check("the deprecation points at the acceptance record", /artifacts\/ACCEPTANCE-2\.md/.test(fetchMod));
+}
+/* -------------------------------- TASK-12 F1: the app-data config layer -- */
+
+section("config file layer (F1: ESM must not silently drop <dataDir>/config.json)");
+{
+  const requireFromHere = createRequire(import.meta.url);
+  const fs = requireFromHere("node:fs");
+  const os = requireFromHere("node:os");
+  const path = requireFromHere("node:path");
+
+  const freshDir = () => fs.mkdtempSync(path.join(os.tmpdir(), "pc-config-test-"));
+  const cleanup = (dir) => { try { fs.rmSync(dir, { recursive: true, force: true }); } catch { /* best effort */ } };
+  const writeConfig = (dir, text) => fs.writeFileSync(path.join(dir, "config.json"), text, "utf8");
+
+  // (1) a valid file is read back into sources.appData
+  {
+    const dir = freshDir();
+    writeConfig(dir, JSON.stringify({ baseUrl: "http://127.0.0.1:9999", timeoutMs: 1234, prestep: false }));
+    const config = resolveConfig({ dataDir: dir });
+    check("a valid config.json fills sources.appData", Object.keys(config.sources.appData).length === 3, config.sources.appData);
+    check("the file's baseUrl wins over the default", config.baseUrl === "http://127.0.0.1:9999", config.baseUrl);
+    check("the file's timeoutMs is read", config.timeoutMs === 1234, config.timeoutMs);
+    check("the file's boolean is read", config.prestep === false, config.prestep);
+    cleanup(dir);
+  }
+
+  // (2) a broken file is the normal case, not an error
+  {
+    const dir = freshDir();
+    writeConfig(dir, "not json{");
+    let threw = null;
+    let config = null;
+    try {
+      config = resolveConfig({ dataDir: dir });
+    } catch (error) {
+      threw = error;
+    }
+    check("a corrupt config.json does not throw", threw === null, threw && threw.message);
+    check("a corrupt config.json degrades to an empty appData layer", JSON.stringify(config.sources.appData) === "{}", config.sources.appData);
+    check("the defaults still apply after a corrupt file", config.baseUrl === DEFAULTS.baseUrl, config.baseUrl);
+    cleanup(dir);
+  }
+
+  // The same trap the audit found: a non-object JSON document must not be trusted.
+  {
+    const dir = freshDir();
+    writeConfig(dir, "[1,2,3]");
+    const config = resolveConfig({ dataDir: dir });
+    check("a JSON array is not treated as a config object", JSON.stringify(config.sources.appData) === "{}", config.sources.appData);
+    cleanup(dir);
+  }
+
+  // (3) the override chain: file beats env; explicit beats file
+  {
+    const dir = freshDir();
+    writeConfig(dir, JSON.stringify({ baseUrl: "http://127.0.0.1:7777" }));
+    const envKey = "POWERCONTEXT_HANA_BASE_URL";
+    const saved = process.env[envKey];
+    process.env[envKey] = "http://127.0.0.1:8888";
+    try {
+      const fromFile = resolveConfig({ dataDir: dir });
+      check("the config file outranks the environment", fromFile.baseUrl === "http://127.0.0.1:7777", fromFile.baseUrl);
+      check("both sources are reported for diagnosis", Boolean(fromFile.sources.env.baseUrl) && Boolean(fromFile.sources.appData.baseUrl), fromFile.sources);
+      const explicit = resolveConfig({ dataDir: dir }, { baseUrl: "http://127.0.0.1:6666" });
+      check("an explicit override outranks the config file", explicit.baseUrl === "http://127.0.0.1:6666", explicit.baseUrl);
+      check("the explicit value is reported too", explicit.sources.explicit.baseUrl === "http://127.0.0.1:6666", explicit.sources.explicit);
+    } finally {
+      if (saved === undefined) delete process.env[envKey];
+      else process.env[envKey] = saved;
+    }
+    cleanup(dir);
+  }
+
+  // (4) anti-regression: the module must stay pure ESM. This is the assertion that
+  // makes the audit's finding impossible to reintroduce — a bare require in ESM scope
+  // is exactly what silently disabled the layer.
+  {
+    const source = fs.readFileSync(path.join(path.dirname(new URL(import.meta.url).pathname), "config.js"), "utf8");
+    check("config.js contains no bare require()", !/\brequire\s*\(/.test(source), "a bare require in ESM scope is a ReferenceError");
+    check("config.js imports what it uses statically", /import \{ readFileSync \} from "node:fs"/.test(source) && /import \{ join \} from "node:path"/.test(source));
+  }
+}
+/* --------------------- TASK-12 F4/F5: doctor wiring and README honesty ---- */
+
+section("F4: /pc doctor names the configuration layers that contributed");
+{
+  const requireFromHere = createRequire(import.meta.url);
+  const fs = requireFromHere("node:fs");
+  const path = requireFromHere("node:path");
+  const appDir = path.join(path.dirname(new URL(import.meta.url).pathname), "..");
+
+  /** A Server that answers readiness, so doctor reaches the config line. */
+  const readySdk = { network: { async fetch() { return { ok: true, status: 200, async text() { return JSON.stringify({ status: "ready", checks: {} }); } }; } } };
+  const readyProbe = async () => ({ ok: true, status: "ready", checks: {}, checkedAt: new Date().toISOString(), capabilities: {} });
+
+  const ENV_KEYS = ["POWERCONTEXT_HANA_BASE_URL", "POWERCONTEXT_HANA_SCOPE_ID", "POWERCONTEXT_HANA_TIMEOUT_MS"];
+  const saved = {};
+  for (const key of ENV_KEYS) { saved[key] = process.env[key]; delete process.env[key]; }
+  try {
+    // (a) nothing configured → the line says so rather than going blank.
+    const bare = resolveConfig(readySdk, {});
+    const bareOut = await commandDoctor(readySdk, bare, readyProbe);
+    check("doctor prints a config-source line", /^config from: /m.test(bareOut), bareOut.split("\n").filter((l) => l.includes("config")).join(" | "));
+    check("with nothing configured it says defaults", /^config from: defaults$/m.test(bareOut), bareOut);
+    // Comments legitimately explain the removed field, so only executable code is checked.
+    const toolsCode = fs.readFileSync(path.join(appDir, "lib/tools.js"), "utf8")
+      .replace(/\/\*[\s\S]*?\*\//g, "")
+      .split("\n").filter((line) => !/^\s*\//.test(line)).join("\n");
+    check("the dead probe field is gone from the renderer", !/verdict\.configSource/.test(toolsCode), "the renderer must read config.sources, not a field probe never returns");
+
+    // (b) an env override is named.
+    process.env.POWERCONTEXT_HANA_BASE_URL = "http://127.0.0.1:8123";
+    const withEnv = resolveConfig(readySdk, {});
+    const envOut = await commandDoctor(readySdk, withEnv, readyProbe);
+    check("an env override is named as the source", /^config from: env$/m.test(envOut), envOut.split("\n").filter((l) => l.includes("config")).join(" | "));
+    check("the env value is actually in effect", withEnv.baseUrl === "http://127.0.0.1:8123", withEnv.baseUrl);
+  } finally {
+    for (const key of ENV_KEYS) {
+      if (saved[key] === undefined) delete process.env[key];
+      else process.env[key] = saved[key];
+    }
+  }
+
+  // (c) a file layer is named alongside env, and call args come first.
+  {
+    const os = requireFromHere("node:os");
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pc-doctor-src-"));
+    fs.writeFileSync(path.join(dir, "config.json"), JSON.stringify({ timeoutMs: 4321 }), "utf8");
+    const config = resolveConfig({ ...readySdk, dataDir: dir }, {});
+    const out = await commandDoctor({ ...readySdk, dataDir: dir }, config, readyProbe);
+    check("a file layer is named as the source", /^config from: config\.json$/m.test(out), out.split("\n").filter((l) => l.includes("config")).join(" | "));
+    check("the file value is in effect", config.timeoutMs === 4321, config.timeoutMs);
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+section("F5: the READMEs do not point at files the public repo does not ship");
+{
+  const requireFromHere = createRequire(import.meta.url);
+  const fs = requireFromHere("node:fs");
+  const path = requireFromHere("node:path");
+  const appDir = path.join(path.dirname(new URL(import.meta.url).pathname), "..");
+  const repoRoot = path.join(appDir, "..", "..");
+  const zh = fs.readFileSync(path.join(repoRoot, "README.md"), "utf8");
+  const en = fs.readFileSync(path.join(repoRoot, "README_EN.md"), "utf8");
+
+  // `artifacts/` is gitignored, so a reader of the public repo cannot follow a
+  // reference to it. The claim it supported ("some criteria are offline-only") is
+  // kept; the unreachable pointer is not.
+  check("the zh README has no artifacts/ reference", !zh.includes("artifacts/"), "artifacts/ is not published");
+  check("the en README has no artifacts/ reference", !en.includes("artifacts/"), "artifacts/ is not published");
+  check("the zh README still states the offline-only fact", /\u79bb\u7ebf\u65ad\u8a00\u8bc1\u636e/.test(zh));
+  check("the en README still states it", /offline assertions only/.test(en));
+  // The replacement pointer must itself exist, or the fix just swaps one dangling
+  // reference for another.
+  check("the zh README points at docs/VERIFICATION.md", /docs\/VERIFICATION\.md/.test(zh));
+  check("that file actually exists", fs.existsSync(path.join(repoRoot, "docs/VERIFICATION.md")));
+  check("the en README points at it too", /docs\/VERIFICATION\.md/.test(en));
 }
 /* ------------------------------------------------- registration surface -- */
 
